@@ -1,0 +1,17 @@
+[package]
+name = "atproxy"
+version = "0.0.0"         # auto-overridden by build.rs from git history
+edition = "2024"
+description = "Per-app transparent TCP proxy for Android → upstream HTTP CONNECT proxy"
+
+[dependencies]
+tokio = { version = "1", features = ["rt", "net", "macros", "signal", "io-util", "time"] }
+nix = { version = "0.30", features = ["net", "socket", "signal", "user"] }
+libc = "0.2"
+clap = { version = "4", features = ["derive"] }
+
+[profile.release]
+opt-level = "z"
+lto = true
+strip = true
+codegen-units = 1

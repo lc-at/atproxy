@@ -1,0 +1,112 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    name: Build & Release
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            suffix: linux-amd64
+          - target: aarch64-unknown-linux-musl
+            suffix: linux-arm64
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross toolchain (aarch64)
+        if: matrix.target == 'aarch64-unknown-linux-musl'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq gcc-aarch64-linux-gnu
+
+      - name: Install musl tools (x86_64)
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq musl-tools
+
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Package binary
+        run: |
+          cd target/${{ matrix.target }}/release
+          tar czf atproxy-${{ matrix.suffix }}.tar.gz atproxy
+          sha256sum atproxy-${{ matrix.suffix }}.tar.gz > atproxy-${{ matrix.suffix }}.sha256
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: atproxy-${{ matrix.suffix }}
+          path: |
+            target/${{ matrix.target }}/release/atproxy-${{ matrix.suffix }}.tar.gz
+            target/${{ matrix.target }}/release/atproxy-${{ matrix.suffix }}.sha256
+
+  publish:
+    name: Create GitHub Release
+    needs: release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Generate release notes
+        id: notes
+        run: |
+          TAG=${GITHUB_REF#refs/tags/}
+          PREV=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo "")
+          if [ -n "$PREV" ]; then
+            LOG=$(git log ${PREV}..HEAD --pretty=format:"- %s (%h)")
+          else
+            LOG=$(git log --pretty=format:"- %s (%h)" -20)
+          fi
+          {
+            echo "tag=$TAG"
+            echo "notes<<EOF"
+            echo "## What's Changed"
+            echo ""
+            echo "$LOG"
+            echo ""
+            echo "## Assets"
+            echo ""
+            echo "| File | Target |"
+            echo "|------|--------|"
+            echo "| \`atproxy-linux-amd64.tar.gz\` | x86_64 Linux (static musl) |"
+            echo "| \`atproxy-linux-arm64.tar.gz\` | aarch64 Linux / Android (static musl) |"
+            echo ""
+            echo "Verify with: \`sha256sum -c atproxy-*.sha256\`"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.notes.outputs.tag }}
+          body: ${{ steps.notes.outputs.notes }}
+          files: artifacts/*
