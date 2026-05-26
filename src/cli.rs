@@ -9,10 +9,7 @@ use clap::Parser;
 #[derive(Parser)]
 #[command(name = "atproxy", version = env!("ATPROXY_VERSION"), about = "Per-app transparent TCP proxy")]
 pub struct Cli {
-    /// Target to intercept. Can be:
-    ///   - A package name (e.g. com.example.app)
-    ///   - A single UID (e.g. 10188)
-    ///   - Multiple comma-separated UIDs (e.g. 10188,10200,10300)
+    /// Target to redirect (can be: package name, comma-separated UIDs)
     #[arg(value_name = "TARGET")]
     pub target: Option<String>,
 

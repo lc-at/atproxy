@@ -1,11 +1,20 @@
 // SPDX-License-Identifier: MIT
+use std::fs;
 use std::net::SocketAddr;
+use std::os::unix::fs::PermissionsExt;
+use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
+use std::sync::Mutex;
 use std::time::Duration;
 
 use tokio::io::{self, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
+
+/// Global lock to serialize tests that manipulate PATH for mock iptables.
+static MOCK_LOCK: Mutex<()> = Mutex::new(());
+
+// ── Network helpers ──────────────────────────────────────────────
 
 /// Echo server: reads from client, writes the same bytes back.
 pub async fn echo_server(port: u16) -> (SocketAddr, JoinHandle<()>) {
@@ -32,9 +41,7 @@ pub async fn connect_proxy(port: u16) -> (SocketAddr, JoinHandle<()>) {
         loop {
             if let Ok((client, _)) = listener.accept().await {
                 tokio::spawn(async move {
-                    if let Err(e) = proxy_session(client).await {
-                        let _ = e; // connection errors are expected during shutdown
-                    }
+                    if let Err(_e) = proxy_session(client).await {}
                 });
             }
         }
@@ -43,15 +50,11 @@ pub async fn connect_proxy(port: u16) -> (SocketAddr, JoinHandle<()>) {
 }
 
 async fn proxy_session(mut client: TcpStream) -> io::Result<()> {
-    // Read until \r\n\r\n
     let mut buf = vec![0u8; 4096];
     let mut total = 0;
     loop {
         if total >= buf.len() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "request too large",
-            ));
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "request too large"));
         }
         let n = client.read(&mut buf[total..]).await?;
         if n == 0 {
@@ -84,10 +87,8 @@ async fn proxy_session(mut client: TcpStream) -> io::Result<()> {
         .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
         .await?;
 
-    // Bidirectional relay with half-close
     let (mut cr, mut cw) = io::split(client);
     let (mut or_, mut ow) = io::split(origin);
-
     let up = async {
         let r = io::copy(&mut cr, &mut ow).await;
         let _ = ow.shutdown().await;
@@ -98,12 +99,11 @@ async fn proxy_session(mut client: TcpStream) -> io::Result<()> {
         let _ = cw.shutdown().await;
         r
     };
-
     let _ = tokio::join!(up, down);
     Ok(())
 }
 
-/// Chunked server: sends CHUNK1:CHUNK2:CHUNK3 with 200ms delays.
+/// Chunked server: sends CHUNK1:CHUNK2:CHUNK3 with delays.
 pub async fn chunked_server(port: u16) -> (SocketAddr, JoinHandle<()>) {
     let listener = TcpListener::bind(("127.0.0.1", port)).await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -111,10 +111,8 @@ pub async fn chunked_server(port: u16) -> (SocketAddr, JoinHandle<()>) {
         loop {
             if let Ok((mut sock, _)) = listener.accept().await {
                 tokio::spawn(async move {
-                    // Drain trigger message
                     let mut drain = [0u8; 256];
                     let _ = sock.read(&mut drain).await;
-
                     let _ = sock.write_all(b"CHUNK1:").await;
                     tokio::time::sleep(Duration::from_millis(200)).await;
                     let _ = sock.write_all(b"CHUNK2:").await;
@@ -126,6 +124,20 @@ pub async fn chunked_server(port: u16) -> (SocketAddr, JoinHandle<()>) {
     });
     (addr, handle)
 }
+
+/// Poll until a TCP port is accepting connections.
+pub async fn wait_for_port(port: u16) -> bool {
+    for _ in 0..30 {
+        if TcpStream::connect(("127.0.0.1", port)).await.is_ok() {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    false
+}
+
+// ── Process management ───────────────────────────────────────────
 
 /// RAII guard for a spawned subprocess. Kills on drop.
 pub struct Proc {
@@ -177,6 +189,12 @@ impl Drop for Proc {
     }
 }
 
+// ── Root-only helpers (kept for reference, used by ignored tests) ──
+
+pub fn is_root() -> bool {
+    unsafe { libc::geteuid() == 0 }
+}
+
 pub fn iptables_flush() {
     let _ = Command::new("iptables")
         .args(["-t", "nat", "-F", "OUTPUT"])
@@ -193,31 +211,6 @@ pub fn uid_rules_count(uid: u32) -> u32 {
         .lines()
         .filter(|l| l.contains(&uid.to_string()) && l.contains("--uid-owner"))
         .count() as u32
-}
-
-pub fn is_root() -> bool {
-    unsafe { libc::geteuid() == 0 }
-}
-
-pub fn ensure_test_user(uid: u32) {
-    let name = "testapp";
-    if Command::new("id").arg(name).output().is_err() {
-        let _ = Command::new("groupadd")
-            .args(["-g", &uid.to_string(), name])
-            .output();
-        let _ = Command::new("useradd")
-            .args([
-                "-u",
-                &uid.to_string(),
-                "-g",
-                name,
-                "-m",
-                "-s",
-                "/bin/bash",
-                name,
-            ])
-            .output();
-    }
 }
 
 pub fn run_as_uid(uid: u32, cmd: &str) -> std::process::Output {
@@ -237,6 +230,18 @@ pub fn run_as_uid(uid: u32, cmd: &str) -> std::process::Output {
     }
 }
 
+pub fn ensure_test_user(uid: u32) {
+    let name = "testapp";
+    if Command::new("id").arg(name).output().is_err() {
+        let _ = Command::new("groupadd")
+            .args(["-g", &uid.to_string(), name])
+            .output();
+        let _ = Command::new("useradd")
+            .args(["-u", &uid.to_string(), "-g", name, "-m", "-s", "/bin/bash", name])
+            .output();
+    }
+}
+
 pub fn add_dummy_ip(ip: &str) {
     let _ = Command::new("ip")
         .args(["addr", "add", &format!("{}/32", ip), "dev", "lo"])
@@ -249,22 +254,113 @@ pub fn remove_dummy_ip(ip: &str) {
         .output();
 }
 
-/// Poll until a TCP port is accepting connections.
-pub async fn wait_for_port(port: u16) -> bool {
-    for _ in 0..30 {
-        if TcpStream::connect(("127.0.0.1", port)).await.is_ok() {
-            tokio::time::sleep(Duration::from_millis(50)).await;
-            return true;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    false
-}
-
 fn which(name: &str) -> bool {
     Command::new("which")
         .arg(name)
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
+}
+
+// ── Mock iptables ────────────────────────────────────────────────
+
+/// RAII context that installs mock `iptables`/`ip6tables` scripts in PATH.
+///
+/// The mock logs all invocations and, when called with `-t nat -S OUTPUT`,
+/// outputs fake rules containing `MOCK_UID` so that cleanup logic can parse
+/// and delete them.
+pub struct MockIptables {
+    pub log_path: PathBuf,
+    tmpdir: PathBuf,
+    saved_path: Option<String>,
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+impl MockIptables {
+    /// Install mock iptables binaries. Holds MOCK_LOCK for the lifetime of
+    /// the returned guard, serializing PATH manipulation across tests.
+    pub fn install(uid: u32) -> Self {
+        let lock = MOCK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let pid = std::process::id();
+        let tmpdir = std::env::temp_dir().join(format!("atproxy-mock-{pid}"));
+        fs::create_dir_all(&tmpdir).unwrap();
+
+        let log_path = tmpdir.join("iptables.log");
+        let log_display = log_path.display();
+
+        // Shell script that logs args and simulates rule listing
+        let script = format!(
+            "#!/bin/sh\n\
+             echo \"$(basename \"$0\") $@\" >> '{log_display}'\n\
+             if [ \"$1\" = \"-t\" ] && [ \"$2\" = \"nat\" ] && [ \"$3\" = \"-S\" ]; then\n\
+               echo '-P OUTPUT ACCEPT'\n\
+               echo '-A OUTPUT -p tcp -m owner --uid-owner {uid} -j REDIRECT --to-port 9999'\n\
+               echo '-A OUTPUT -p tcp -m owner --uid-owner {uid} -d 127.0.0.0/8 -j RETURN'\n\
+             fi\n\
+             exit 0\n"
+        );
+
+        let ipt_path = tmpdir.join("iptables");
+        let ip6t_path = tmpdir.join("ip6tables");
+        fs::write(&ipt_path, &script).unwrap();
+        fs::write(&ip6t_path, &script).unwrap();
+        fs::set_permissions(&ipt_path, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(&ip6t_path, fs::Permissions::from_mode(0o755)).unwrap();
+
+        // Save and prepend to PATH
+        let saved_path = std::env::var("PATH").ok();
+        let new_path = format!(
+            "{}:{}",
+            tmpdir.display(),
+            saved_path.as_deref().unwrap_or("")
+        );
+        // SAFETY: Test-only PATH manipulation, serialized via MOCK_LOCK.
+        unsafe { std::env::set_var("PATH", &new_path) };
+
+        // Clear any stale log
+        let _ = fs::remove_file(&log_path);
+
+        Self {
+            log_path,
+            tmpdir,
+            saved_path,
+            _lock: lock,
+        }
+    }
+
+    /// Read all logged iptables invocations as `(command, args)` pairs.
+    pub fn calls(&self) -> Vec<(String, String)> {
+        let content = fs::read_to_string(&self.log_path).unwrap_or_default();
+        content
+            .lines()
+            .filter_map(|line| {
+                let (cmd, args) = line.split_once(' ')?;
+                Some((cmd.to_string(), args.to_string()))
+            })
+            .collect()
+    }
+
+    /// Read raw log lines.
+    pub fn raw_calls(&self) -> Vec<String> {
+        fs::read_to_string(&self.log_path)
+            .unwrap_or_default()
+            .lines()
+            .map(String::from)
+            .collect()
+    }
+}
+
+impl Drop for MockIptables {
+    fn drop(&mut self) {
+        // SAFETY: Test-only PATH restoration, serialized via MOCK_LOCK.
+        unsafe {
+            if let Some(ref p) = self.saved_path {
+                std::env::set_var("PATH", p);
+            } else {
+                std::env::remove_var("PATH");
+            }
+        }
+        let _ = fs::remove_dir_all(&self.tmpdir);
+    }
 }
