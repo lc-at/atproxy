@@ -42,11 +42,13 @@ impl Stats {
     }
 
     /// Record upstream bytes transferred.
+    #[allow(clippy::cast_possible_wrap)]
     pub fn add_up(&self, n: u64) {
         self.bytes_up.fetch_add(n as i64, Ordering::Relaxed);
     }
 
     /// Record downstream bytes transferred.
+    #[allow(clippy::cast_possible_wrap)]
     pub fn add_down(&self, n: u64) {
         self.bytes_down.fetch_add(n as i64, Ordering::Relaxed);
     }

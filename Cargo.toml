@@ -1,8 +1,8 @@
 [package]
 name = "atproxy"
-version = "0.0.0"         # auto-overridden by build.rs from git history
+version = "0.0.0" # auto-overridden by build.rs from git history
 edition = "2024"
-description = "Per-app transparent TCP proxy for Android → upstream HTTP CONNECT proxy"
+description = "Per-app transparent TCP proxy for Android to an upstream HTTP proxy"
 
 [dependencies]
 tokio = { version = "1", features = ["rt", "net", "macros", "signal", "io-util", "time"] }

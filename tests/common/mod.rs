@@ -14,8 +14,6 @@ use tokio::task::JoinHandle;
 /// Global lock to serialize tests that manipulate PATH for mock iptables.
 static MOCK_LOCK: Mutex<()> = Mutex::new(());
 
-// ── Network helpers ──────────────────────────────────────────────
-
 /// Echo server: reads from client, writes the same bytes back.
 pub async fn echo_server(port: u16) -> (SocketAddr, JoinHandle<()>) {
     let listener = TcpListener::bind(("127.0.0.1", port)).await.unwrap();
@@ -40,9 +38,7 @@ pub async fn connect_proxy(port: u16) -> (SocketAddr, JoinHandle<()>) {
     let handle = tokio::spawn(async move {
         loop {
             if let Ok((client, _)) = listener.accept().await {
-                tokio::spawn(async move {
-                    if let Err(_e) = proxy_session(client).await {}
-                });
+                tokio::spawn(async move { if let Err(_e) = proxy_session(client).await {} });
             }
         }
     });
@@ -54,7 +50,10 @@ async fn proxy_session(mut client: TcpStream) -> io::Result<()> {
     let mut total = 0;
     loop {
         if total >= buf.len() {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "request too large"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "request too large",
+            ));
         }
         let n = client.read(&mut buf[total..]).await?;
         if n == 0 {
@@ -137,8 +136,6 @@ pub async fn wait_for_port(port: u16) -> bool {
     false
 }
 
-// ── Process management ───────────────────────────────────────────
-
 /// RAII guard for a spawned subprocess. Kills on drop.
 pub struct Proc {
     child: Child,
@@ -189,8 +186,6 @@ impl Drop for Proc {
     }
 }
 
-// ── Root-only helpers (kept for reference, used by ignored tests) ──
-
 pub fn is_root() -> bool {
     unsafe { libc::geteuid() == 0 }
 }
@@ -237,7 +232,16 @@ pub fn ensure_test_user(uid: u32) {
             .args(["-g", &uid.to_string(), name])
             .output();
         let _ = Command::new("useradd")
-            .args(["-u", &uid.to_string(), "-g", name, "-m", "-s", "/bin/bash", name])
+            .args([
+                "-u",
+                &uid.to_string(),
+                "-g",
+                name,
+                "-m",
+                "-s",
+                "/bin/bash",
+                name,
+            ])
             .output();
     }
 }
@@ -261,8 +265,6 @@ fn which(name: &str) -> bool {
         .map(|o| o.status.success())
         .unwrap_or(false)
 }
-
-// ── Mock iptables ────────────────────────────────────────────────
 
 /// RAII context that installs mock `iptables`/`ip6tables` scripts in PATH.
 ///

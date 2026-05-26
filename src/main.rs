@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-//! atproxy — Per-app transparent TCP proxy for Android.
+//! atproxy
 //!
 //! Intercepts TCP connections from specific Android UIDs (or a package) and
 //! tunnels them through an upstream HTTP CONNECT proxy using iptables OUTPUT
@@ -16,7 +16,7 @@ use std::sync::Arc;
 use clap::Parser;
 use tokio::net::TcpListener;
 use tokio::signal::unix::{SignalKind, signal};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 use cli::Cli;
@@ -53,21 +53,17 @@ async fn main() {
     });
 
     // Resolve UIDs and proxy from positional args.
-    let (uids, proxy_str) = match resolve_args(&cli) {
-        Some(v) => v,
-        None => {
-            <Cli as clap::CommandFactory>::command()
-                .print_help()
-                .unwrap();
-            std::process::exit(1);
-        }
+    let Some((uids, proxy_str)) = resolve_args(&cli) else {
+        <Cli as clap::CommandFactory>::command()
+            .print_help()
+            .unwrap();
+        std::process::exit(1);
     };
 
     if cli.clean {
         for &uid in &uids {
             let ip4 = Iptables { uid, ipv6: false };
             let ip6 = Iptables { uid, ipv6: true };
-
             ip4.cleanup();
             if cli.ipv6 {
                 ip6.cleanup();
@@ -76,12 +72,9 @@ async fn main() {
         return;
     }
 
-    let (proxy_host, proxy_port) = match parse_host_port(&proxy_str) {
-        Some(v) => v,
-        None => {
-            error!("bad proxy address: expected host:port");
-            std::process::exit(1);
-        }
+    let Some((proxy_host, proxy_port)) = parse_host_port(&proxy_str) else {
+        error!("bad proxy address: expected host:port");
+        std::process::exit(1);
     };
 
     let proxy_addr: std::net::SocketAddr =
@@ -96,10 +89,7 @@ async fn main() {
             }
         };
 
-    let proxy_ip_str = match proxy_addr {
-        std::net::SocketAddr::V4(a) => a.ip().to_string(),
-        std::net::SocketAddr::V6(a) => a.ip().to_string(),
-    };
+    let proxy_ip_str = proxy_addr.ip().to_string();
     let proxy_port_u16 = proxy_addr.port();
 
     if !nix::unistd::geteuid().is_root() {
@@ -111,10 +101,20 @@ async fn main() {
 
     for &uid in &uids {
         let ip4 = Iptables { uid, ipv6: false };
-        ip4.apply(cli.port, &proxy_ip_str, proxy_port_u16);
+        if !ip4.apply(cli.port, &proxy_ip_str, proxy_port_u16) {
+            error!(uid, "failed to apply iptables rules for UID");
+            std::process::exit(1);
+        }
         if cli.ipv6 {
             let ip6 = Iptables { uid, ipv6: true };
-            ip6.apply(cli.port, &proxy_ip_str, proxy_port_u16);
+            if !ip6.apply(cli.port, &proxy_ip_str, proxy_port_u16) {
+                warn!(
+                    uid,
+                    "IPv6 rules not applied, \
+                     kernel may lack CONFIG_IP6_NF_NAT. \
+                     Only IPv4 traffic will be proxied for this UID."
+                );
+            }
         }
     }
 
@@ -133,12 +133,9 @@ async fn main() {
         "listening for redirected connections"
     );
 
-    let proxy_addr_v4 = match proxy_addr {
-        std::net::SocketAddr::V4(a) => a,
-        _ => {
-            error!("only IPv4 proxy addresses supported for CONNECT");
-            std::process::exit(1);
-        }
+    let std::net::SocketAddr::V4(proxy_addr_v4) = proxy_addr else {
+        error!("only IPv4 proxy addresses supported for CONNECT");
+        std::process::exit(1);
     };
 
     loop {
@@ -192,7 +189,6 @@ async fn main() {
 fn resolve_args(cli: &Cli) -> Option<(Vec<u32>, String)> {
     let target = cli.target.as_ref()?;
     let proxy = cli.proxy.as_ref()?;
-
     let uids = resolve::resolve_target(target)?;
     Some((uids, proxy.clone()))
 }

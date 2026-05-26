@@ -14,10 +14,6 @@ fn bin() -> String {
     env!("CARGO_BIN_EXE_atproxy").to_string()
 }
 
-// ═══════════════════════════════════════════════════════════════════
-// CLI tests — no root needed
-// ═══════════════════════════════════════════════════════════════════
-
 #[test]
 fn test_cli_help() {
     let output = Command::new(bin()).arg("--help").output().unwrap();
@@ -52,7 +48,9 @@ fn test_cli_missing_proxy() {
     let output = Command::new(bin()).arg("10188").output().unwrap();
     let stderr = String::from_utf8_lossy(&output.stderr);
     // Should print help (missing required proxy positional)
-    assert!(stderr.contains("Usage") || stderr.contains("required") || output.status.code() == Some(1));
+    assert!(
+        stderr.contains("Usage") || stderr.contains("required") || output.status.code() == Some(1)
+    );
 }
 
 #[test]
@@ -75,10 +73,6 @@ fn test_cli_comma_uids_bad_mixed() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("invalid UID") || output.status.code() == Some(1));
 }
-
-// ═══════════════════════════════════════════════════════════════════
-// iptables tests — use mock iptables, no root needed
-// ═══════════════════════════════════════════════════════════════════
 
 /// Test that atproxy applies the correct iptables rules when started.
 /// Uses mock iptables to verify rule generation without needing root.
@@ -140,8 +134,8 @@ fn test_iptables_redirect_rule() {
     // (will fail at root check, but iptables apply happens before root check
     // in the current code? Let me check the flow...
     //
-    // Flow: parse args → resolve UIDs → if --clean, cleanup and return
-    // → parse proxy → DNS resolve → ROOT CHECK → apply iptables
+    // Flow: parse args →  resolve UIDs →  if --clean, cleanup and return
+    // →  parse proxy →  DNS resolve →  ROOT CHECK →  apply iptables
     //
     // So iptables apply happens AFTER root check. We can't test it without root.
     // But --clean works without root (returns before root check).
@@ -252,10 +246,6 @@ fn test_ipv6_uses_ip6tables() {
     );
 }
 
-// ═══════════════════════════════════════════════════════════════════
-// Root-only e2e tests (iptables + SO_ORIGINAL_DST + UID switching)
-// ═══════════════════════════════════════════════════════════════════
-
 fn root_setup() {
     if !is_root() {
         return;
@@ -325,16 +315,34 @@ root_test!(test_root_iptables_apply_remove, {
 root_test!(test_root_clean_removes_stale_rules, {
     Command::new("iptables")
         .args([
-            "-t", "nat", "-A", "OUTPUT", "-p", "tcp", "-m", "owner",
-            "--uid-owner", &UID_TEST.to_string(), "-j", "REDIRECT",
-            "--to-port", "9999",
+            "-t",
+            "nat",
+            "-A",
+            "OUTPUT",
+            "-p",
+            "tcp",
+            "-m",
+            "owner",
+            "--uid-owner",
+            &UID_TEST.to_string(),
+            "-j",
+            "REDIRECT",
+            "--to-port",
+            "9999",
         ])
         .output()
         .unwrap();
 
     assert!(uid_rules_count(UID_TEST) >= 1, "stale rule present");
 
-    let clean = Proc::spawn(&bin(), &["--clean", &UID_TEST.to_string(), &format!("127.0.0.1:{PROXY_PORT}")]);
+    let clean = Proc::spawn(
+        &bin(),
+        &[
+            "--clean",
+            &UID_TEST.to_string(),
+            &format!("127.0.0.1:{PROXY_PORT}"),
+        ],
+    );
     let status = clean.wait();
     assert!(status.success(), "--clean should succeed");
 
@@ -361,7 +369,10 @@ root_test!(test_root_e2e_traffic_relay, {
         &run_as_uid(UID_TEST, "echo RELAY_TEST | nc -w3 10.0.0.1 19999").stdout,
     )
     .into_owned();
-    assert!(result.contains("RELAY_TEST"), "echo through proxy chain, got: {result}");
+    assert!(
+        result.contains("RELAY_TEST"),
+        "echo through proxy chain, got: {result}"
+    );
 
     drop(_ap);
     echo_h.abort();

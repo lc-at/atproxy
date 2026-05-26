@@ -5,7 +5,7 @@ use clap::Parser;
 ///
 /// Intercepts TCP connections from a specific Android UID or package name and
 /// tunnels them through an upstream HTTP CONNECT proxy using iptables OUTPUT
-/// REDIRECT rules and SO_ORIGINAL_DST recovery.
+/// REDIRECT rules and `SO_ORIGINAL_DST` recovery.
 #[derive(Parser)]
 #[command(name = "atproxy", version = env!("ATPROXY_VERSION"), about = "Per-app transparent TCP proxy")]
 pub struct Cli {

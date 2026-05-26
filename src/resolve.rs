@@ -126,7 +126,10 @@ mod tests {
     fn test_parse_uid_no_substring_false_positive() {
         let out = "package:com.example.app uid:10188\npackage:com.example.app.debug uid:10200\n";
         assert_eq!(parse_uid_from_output("com.example.app", out), Some(10188));
-        assert_eq!(parse_uid_from_output("com.example.app.debug", out), Some(10200));
+        assert_eq!(
+            parse_uid_from_output("com.example.app.debug", out),
+            Some(10200)
+        );
     }
 
     #[test]
@@ -149,12 +152,18 @@ mod tests {
 
     #[test]
     fn test_resolve_target_comma_uids() {
-        assert_eq!(resolve_target("10188,10200,10300"), Some(vec![10188, 10200, 10300]));
+        assert_eq!(
+            resolve_target("10188,10200,10300"),
+            Some(vec![10188, 10200, 10300])
+        );
     }
 
     #[test]
     fn test_resolve_target_comma_uids_with_spaces() {
-        assert_eq!(resolve_target("10188, 10200 , 10300"), Some(vec![10188, 10200, 10300]));
+        assert_eq!(
+            resolve_target("10188, 10200 , 10300"),
+            Some(vec![10188, 10200, 10300])
+        );
     }
 
     #[test]
@@ -174,5 +183,5 @@ mod tests {
 
     // Package name resolution requires `pm` binary (Android), tested via
     // parse_uid_from_output above. resolve_target with dots calls resolve_uid
-    // which invokes `pm` — not testable outside Android.
+    // which invokes `pm` (not testable outside Android).
 }

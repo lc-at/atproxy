@@ -4,6 +4,11 @@
 //! Applies and cleans up `nat/OUTPUT` rules that redirect TCP connections
 //! from a specific UID to the local transparent-proxy listener, while
 //! exempting loopback and direct-to-proxy traffic.
+//!
+//! **IPv6 note:** `ip6tables -t nat` requires kernel ≥3.7 with
+//! `CONFIG_IP6_NF_NAT` enabled. Many Android kernels lack this module.
+//! [`apply()`] returns `false` if the rules could not be applied, allowing
+//! the caller to warn the user.
 
 use std::process::Command;
 use tracing::{debug, error, info, warn};
@@ -19,6 +24,7 @@ impl Iptables {
         if self.ipv6 { "ip6tables" } else { "iptables" }
     }
 
+    /// Execute an iptables command. Returns `true` on success.
     fn run(&self, args: &[&str]) -> bool {
         let cmd = self.cmd_name();
         debug!(command = cmd, args = ?args, "executing iptables command");
@@ -46,12 +52,16 @@ impl Iptables {
 
     /// Apply iptables rules: REDIRECT the UID's TCP traffic to `listen_port`,
     /// with RETURN exemptions for loopback and direct-to-proxy connections.
-    pub fn apply(&self, listen_port: u16, proxy_ip: &str, proxy_port: u16) {
+    ///
+    /// Returns `true` if the main REDIRECT rule was applied successfully,
+    /// `false` otherwise (e.g. ip6tables nat table not available).
+    pub fn apply(&self, listen_port: u16, proxy_ip: &str, proxy_port: u16) -> bool {
         let uid_s = self.uid.to_string();
         let port_s = listen_port.to_string();
         let lo = if self.ipv6 { "::1/128" } else { "127.0.0.0/8" };
 
-        self.run(&[
+        // Main REDIRECT rule, this is the critical one.
+        if !self.run(&[
             "-t",
             "nat",
             "-I",
@@ -67,8 +77,19 @@ impl Iptables {
             "REDIRECT",
             "--to-port",
             &port_s,
-        ]);
+        ]) {
+            if self.ipv6 {
+                warn!(
+                    uid = self.uid,
+                    "ip6tables nat table not available, \
+                     kernel may lack CONFIG_IP6_NF_NAT. \
+                     IPv6 traffic will NOT be proxied."
+                );
+            }
+            return false;
+        }
 
+        // Exempt direct-to-proxy connections (avoid redirect loop).
         if !proxy_ip.is_empty() && proxy_ip != "0.0.0.0" && proxy_ip != "::" {
             let pp = proxy_port.to_string();
             self.run(&[
@@ -92,6 +113,7 @@ impl Iptables {
             ]);
         }
 
+        // Exempt loopback connections.
         self.run(&[
             "-t",
             "nat",
@@ -116,6 +138,7 @@ impl Iptables {
             ipv6 = self.ipv6,
             "iptables rules applied"
         );
+        true
     }
 
     /// Remove all iptables rules matching this UID from the nat OUTPUT chain.
@@ -123,12 +146,11 @@ impl Iptables {
         let cmd = self.cmd_name();
         let uid_s = self.uid.to_string();
 
-        let output = match Command::new(cmd)
+        let Ok(output) = Command::new(cmd)
             .args(["-t", "nat", "-S", "OUTPUT"])
             .output()
-        {
-            Ok(o) => o,
-            Err(_) => return,
+        else {
+            return;
         };
 
         let rules = String::from_utf8_lossy(&output.stdout);

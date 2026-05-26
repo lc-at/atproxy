@@ -7,8 +7,9 @@ proxy (e.g. Burp Suite) using iptables NAT REDIRECT.
    app    <-> | atproxy | <->  HTTP Proxy  <->  Original dest.
 (uid: 37)     ``````````'    (pentest:8080)
 
-Example command:
+Example commands:
 ./atproxy 37 pentest:8080
+./atproxy com.example pentest:8080
 
 Pre-built binaries: https://github.com/lc-at/atproxy/releases
 
