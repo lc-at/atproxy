@@ -36,10 +36,19 @@ pub fn resolve_uid(package: &str) -> Option<u32> {
 
     for line in stdout.lines() {
         // Format: package:com.example.app uid:10188
-        if !line.contains(package) {
+        // Parse the package field exactly to avoid substring false matches
+        // (e.g. "com.example.app" must not match "com.example.app.debug").
+        let Some(rest) = line.strip_prefix("package:") else {
+            continue;
+        };
+        let Some(space) = rest.find(' ') else {
+            continue;
+        };
+        let pkg_name = &rest[..space];
+        if pkg_name != package {
             continue;
         }
-        if let Some(uid_part) = line.split("uid:").nth(1)
+        if let Some(uid_part) = rest[space + 1..].strip_prefix("uid:")
             && let Ok(uid) = uid_part.trim().parse::<u32>()
         {
             debug!(package, uid, "resolved package to UID");
@@ -53,17 +62,54 @@ pub fn resolve_uid(package: &str) -> Option<u32> {
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn test_parse_pm_output_line() {
-        let line = "package:com.example.app uid:10188";
-        let uid_part = line.split("uid:").nth(1).unwrap().trim();
-        assert_eq!(uid_part.parse::<u32>().unwrap(), 10188);
+    /// Simulates the pm list packages -U parsing logic.
+    fn resolve_from_output(package: &str, stdout: &str) -> Option<u32> {
+        for line in stdout.lines() {
+            let Some(rest) = line.strip_prefix("package:") else {
+                continue;
+            };
+            let Some(space) = rest.find(' ') else {
+                continue;
+            };
+            let pkg_name = &rest[..space];
+            if pkg_name != package {
+                continue;
+            }
+            if let Some(uid_part) = rest[space + 1..].strip_prefix("uid:")
+                && let Ok(uid) = uid_part.trim().parse::<u32>()
+            {
+                return Some(uid);
+            }
+        }
+        None
     }
 
     #[test]
-    fn test_parse_pm_output_wrong_package() {
-        let line = "package:com.other.app uid:10200";
-        let uid_part = line.split("uid:").nth(1).unwrap().trim();
-        assert_eq!(uid_part.parse::<u32>().unwrap(), 10200);
+    fn test_exact_match() {
+        let out = "package:com.example.app uid:10188\npackage:com.other.app uid:10200\n";
+        assert_eq!(resolve_from_output("com.example.app", out), Some(10188));
+        assert_eq!(resolve_from_output("com.other.app", out), Some(10200));
+    }
+
+    #[test]
+    fn test_no_substring_false_positive() {
+        let out = "package:com.example.app uid:10188\npackage:com.example.app.debug uid:10200\n";
+        // "com.example.app" must NOT match "com.example.app.debug"
+        assert_eq!(resolve_from_output("com.example.app", out), Some(10188));
+        assert_eq!(resolve_from_output("com.example.app.debug", out), Some(10200));
+    }
+
+    #[test]
+    fn test_not_found() {
+        let out = "package:com.example.app uid:10188\n";
+        assert_eq!(resolve_from_output("com.nonexistent", out), None);
+    }
+
+    #[test]
+    fn test_partial_name_no_match() {
+        let out = "package:com.example.app uid:10188\npackage:com.other.app uid:10200\n";
+        // Substring like "com.app" or "com.other" must not match
+        assert_eq!(resolve_from_output("com.app", out), None);
+        assert_eq!(resolve_from_output("com.other", out), None);
     }
 }

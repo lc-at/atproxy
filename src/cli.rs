@@ -3,19 +3,18 @@ use clap::Parser;
 
 /// Per-app transparent TCP proxy for Android → upstream HTTP CONNECT proxy.
 ///
-/// Intercepts TCP connections from a specific Android UID (or package) and
+/// Intercepts TCP connections from a specific Android UID or package name and
 /// tunnels them through an upstream HTTP CONNECT proxy using iptables OUTPUT
 /// REDIRECT rules and SO_ORIGINAL_DST recovery.
 #[derive(Parser)]
 #[command(name = "atproxy", version = env!("ATPROXY_VERSION"), about = "Per-app transparent TCP proxy")]
 pub struct Cli {
-    /// Target UID to intercept (hint: use `pm list packages -U`).
-    ///
-    /// Mutually exclusive with `--filter`.
-    #[arg(conflicts_with = "filter")]
-    pub uid: Option<u32>,
+    /// Target UID to intercept, or package name if `--filter` is set.
+    #[arg(value_name = "UID|PACKAGE")]
+    pub target: Option<String>,
 
     /// Upstream HTTP proxy address (host:port).
+    #[arg(value_name = "PROXY")]
     pub proxy: Option<String>,
 
     /// Listen port for redirected connections.
@@ -34,10 +33,9 @@ pub struct Cli {
     #[arg(long)]
     pub clean: bool,
 
-    /// Android package name to intercept (e.g. `com.example.app`).
+    /// Treat the first positional argument as a package name instead of UID.
     ///
     /// Resolves to a UID at startup via `pm list packages -U`.
-    /// Mutually exclusive with the positional UID argument.
-    #[arg(short, long, conflicts_with = "uid")]
-    pub filter: Option<String>,
+    #[arg(short, long)]
+    pub filter: bool,
 }

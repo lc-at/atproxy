@@ -52,9 +52,10 @@ async fn main() {
         e.exit();
     });
 
-    // Resolve UID from either --uid or --filter (mutually exclusive via clap).
-    let uid = match resolve_uid_arg(&cli) {
-        Some(u) => u,
+    // Resolve UID and proxy from positional args.
+    // When --filter is used, the first positional holds the proxy (not UID).
+    let (uid, proxy_str) = match resolve_args(&cli) {
+        Some(v) => v,
         None => {
             <Cli as clap::CommandFactory>::command()
                 .print_help()
@@ -75,17 +76,7 @@ async fn main() {
         return;
     }
 
-    let proxy_str = match cli.proxy {
-        Some(ref s) => s,
-        None => {
-            <Cli as clap::CommandFactory>::command()
-                .print_help()
-                .unwrap();
-            std::process::exit(1);
-        }
-    };
-
-    let (proxy_host, proxy_port) = match parse_host_port(proxy_str) {
+    let (proxy_host, proxy_port) = match parse_host_port(&proxy_str) {
         Some(v) => v,
         None => {
             error!("bad proxy address: expected host:port");
@@ -185,17 +176,23 @@ async fn main() {
     }
 }
 
-/// Resolve the effective UID from CLI arguments.
+/// Resolve UID and proxy address from CLI arguments.
 ///
-/// Accepts either `--uid <n>` (direct) or `--filter <package>` (resolved via
-/// `pm list packages -U`). Returns `None` if neither is provided.
-fn resolve_uid_arg(cli: &Cli) -> Option<u32> {
-    match (cli.uid, &cli.filter) {
-        (Some(u), _) => Some(u),
-        (_, Some(pkg)) => {
-            let uid = resolve::resolve_uid(pkg)?;
-            Some(uid)
-        }
-        (None, None) => None,
-    }
+/// Two modes:
+/// - **Default**: `atproxy 10188 proxy:8080` — first positional is numeric UID.
+/// - **Filter**: `atproxy -f com.app proxy:8080` — first positional is package
+///   name, resolved to UID via `pm list packages -U`.
+///
+/// Returns `None` if required arguments are missing.
+fn resolve_args(cli: &Cli) -> Option<(u32, String)> {
+    let target = cli.target.as_ref()?;
+    let proxy = cli.proxy.as_ref()?;
+
+    let uid = if cli.filter {
+        resolve::resolve_uid(target)?
+    } else {
+        target.parse::<u32>().ok()?
+    };
+
+    Some((uid, proxy.clone()))
 }
