@@ -141,6 +141,7 @@ impl Iptables {
             let delete_rule = line.replace("-A ", "-D ");
             let mut args: Vec<&str> = vec!["-t", "nat"];
             args.extend(delete_rule.split_whitespace());
+            debug!(command = cmd, args = ?args, "removing iptables rule");
             let status = Command::new(cmd)
                 .args(&args)
                 .stdout(std::process::Stdio::null())
@@ -148,6 +149,12 @@ impl Iptables {
                 .status();
             if status.is_ok_and(|s| s.success()) {
                 removed += 1;
+            } else {
+                warn!(
+                    command = cmd,
+                    rule = delete_rule.as_str(),
+                    "failed to remove iptables rule"
+                );
             }
         }
 
