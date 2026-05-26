@@ -9,8 +9,11 @@ use clap::Parser;
 #[derive(Parser)]
 #[command(name = "atproxy", version = env!("ATPROXY_VERSION"), about = "Per-app transparent TCP proxy")]
 pub struct Cli {
-    /// Target UID to intercept, or package name if `--filter` is set.
-    #[arg(value_name = "UID|PACKAGE")]
+    /// Target to intercept. Can be:
+    ///   - A package name (e.g. com.example.app)
+    ///   - A single UID (e.g. 10188)
+    ///   - Multiple comma-separated UIDs (e.g. 10188,10200,10300)
+    #[arg(value_name = "TARGET")]
     pub target: Option<String>,
 
     /// Upstream HTTP proxy address (host:port).
@@ -29,13 +32,7 @@ pub struct Cli {
     #[arg(short = '6', long)]
     pub ipv6: bool,
 
-    /// Remove stale iptables rules for UID and exit.
+    /// Remove stale iptables rules for resolved UIDs and exit.
     #[arg(long)]
     pub clean: bool,
-
-    /// Treat the first positional argument as a package name instead of UID.
-    ///
-    /// Resolves to a UID at startup via `pm list packages -U`.
-    #[arg(short, long)]
-    pub filter: bool,
 }

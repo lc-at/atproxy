@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 //! atproxy — Per-app transparent TCP proxy for Android.
 //!
-//! Intercepts TCP connections from a specific Android UID (or package) and
+//! Intercepts TCP connections from specific Android UIDs (or a package) and
 //! tunnels them through an upstream HTTP CONNECT proxy using iptables OUTPUT
 //! REDIRECT rules and `SO_ORIGINAL_DST` recovery.
 
@@ -52,9 +52,8 @@ async fn main() {
         e.exit();
     });
 
-    // Resolve UID and proxy from positional args.
-    // When --filter is used, the first positional holds the proxy (not UID).
-    let (uid, proxy_str) = match resolve_args(&cli) {
+    // Resolve UIDs and proxy from positional args.
+    let (uids, proxy_str) = match resolve_args(&cli) {
         Some(v) => v,
         None => {
             <Cli as clap::CommandFactory>::command()
@@ -65,14 +64,15 @@ async fn main() {
     };
 
     if cli.clean {
-        let ip4 = Iptables { uid, ipv6: false };
-        let ip6 = Iptables { uid, ipv6: true };
+        for &uid in &uids {
+            let ip4 = Iptables { uid, ipv6: false };
+            let ip6 = Iptables { uid, ipv6: true };
 
-        ip4.cleanup();
-        if cli.ipv6 {
-            ip6.cleanup();
+            ip4.cleanup();
+            if cli.ipv6 {
+                ip6.cleanup();
+            }
         }
-
         return;
     }
 
@@ -109,11 +109,13 @@ async fn main() {
 
     let stats = Arc::new(Stats::new());
 
-    let ip4 = Iptables { uid, ipv6: false };
-    let ip6 = Iptables { uid, ipv6: true };
-    ip4.apply(cli.port, &proxy_ip_str, proxy_port_u16);
-    if cli.ipv6 {
-        ip6.apply(cli.port, &proxy_ip_str, proxy_port_u16);
+    for &uid in &uids {
+        let ip4 = Iptables { uid, ipv6: false };
+        ip4.apply(cli.port, &proxy_ip_str, proxy_port_u16);
+        if cli.ipv6 {
+            let ip6 = Iptables { uid, ipv6: true };
+            ip6.apply(cli.port, &proxy_ip_str, proxy_port_u16);
+        }
     }
 
     let mut sigterm = signal(SignalKind::terminate()).expect("sigterm handler");
@@ -125,6 +127,7 @@ async fn main() {
 
     info!(
         listen_port = cli.port,
+        uids = ?uids,
         proxy_ip = proxy_ip_str.as_str(),
         proxy_port = proxy_port_u16,
         "listening for redirected connections"
@@ -168,31 +171,28 @@ async fn main() {
     );
 
     info!("cleaning iptables rules");
-    let ip4 = Iptables { uid, ipv6: false };
-    let ip6 = Iptables { uid, ipv6: true };
-    ip4.cleanup();
-    if cli.ipv6 {
-        ip6.cleanup();
+    for &uid in &uids {
+        let ip4 = Iptables { uid, ipv6: false };
+        let ip6 = Iptables { uid, ipv6: true };
+        ip4.cleanup();
+        if cli.ipv6 {
+            ip6.cleanup();
+        }
     }
 }
 
-/// Resolve UID and proxy address from CLI arguments.
+/// Resolve UIDs and proxy address from CLI arguments.
 ///
-/// Two modes:
-/// - **Default**: `atproxy 10188 proxy:8080` — first positional is numeric UID.
-/// - **Filter**: `atproxy -f com.app proxy:8080` — first positional is package
-///   name, resolved to UID via `pm list packages -U`.
+/// The TARGET positional auto-detects its type:
+/// - Package name (contains `.`) → resolved via `pm list packages -U`
+/// - Single UID (e.g. `10188`)
+/// - Comma-separated UIDs (e.g. `10188,10200`)
 ///
-/// Returns `None` if required arguments are missing.
-fn resolve_args(cli: &Cli) -> Option<(u32, String)> {
+/// Returns `None` if required arguments are missing or resolution fails.
+fn resolve_args(cli: &Cli) -> Option<(Vec<u32>, String)> {
     let target = cli.target.as_ref()?;
     let proxy = cli.proxy.as_ref()?;
 
-    let uid = if cli.filter {
-        resolve::resolve_uid(target)?
-    } else {
-        target.parse::<u32>().ok()?
-    };
-
-    Some((uid, proxy.clone()))
+    let uids = resolve::resolve_target(target)?;
+    Some((uids, proxy.clone()))
 }
