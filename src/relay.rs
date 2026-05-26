@@ -1,4 +1,10 @@
 // SPDX-License-Identifier: MIT
+//! TCP relay logic: transparent proxy via HTTP CONNECT handshake.
+//!
+//! Recovers the original destination via `SO_ORIGINAL_DST`, establishes an
+//! HTTP CONNECT tunnel through the upstream proxy, then performs bidirectional
+//! relay between client and proxy.
+
 use std::net::SocketAddrV4;
 use std::os::unix::io::AsRawFd;
 use std::sync::Arc;
@@ -6,9 +12,11 @@ use std::sync::Arc;
 use nix::sys::socket::{getsockopt, sockopt::OriginalDst};
 use tokio::io::{self, AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+use tracing::{debug, info, warn};
 
 use crate::stats::Stats;
 
+/// Recover the original destination address from a redirected socket.
 pub fn get_original_dst(sock: &TcpStream) -> Option<SocketAddrV4> {
     use std::net::Ipv4Addr;
     let addr = getsockopt(sock, OriginalDst).ok()?;
@@ -17,6 +25,7 @@ pub fn get_original_dst(sock: &TcpStream) -> Option<SocketAddrV4> {
     Some(SocketAddrV4::new(ip, port))
 }
 
+/// Set TCP keepalive parameters on a socket.
 pub fn set_keepalive(sock: &TcpStream) {
     let fd = sock.as_raw_fd();
     unsafe {
@@ -64,11 +73,8 @@ fn find_header_end(buf: &[u8]) -> Option<usize> {
     None
 }
 
-async fn connect_handshake(
-    proxy: &mut TcpStream,
-    target: SocketAddrV4,
-    verbose: bool,
-) -> io::Result<Vec<u8>> {
+/// Perform the HTTP CONNECT handshake with the upstream proxy.
+async fn connect_handshake(proxy: &mut TcpStream, target: SocketAddrV4) -> io::Result<Vec<u8>> {
     let req = format!(
         "CONNECT {}:{} HTTP/1.1\r\nHost: {}:{}\r\n\r\n",
         target.ip(),
@@ -102,12 +108,12 @@ async fn connect_handshake(
                 .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "non-UTF8 response"))?;
 
             if !header.contains(" 200 ") {
-                if verbose {
-                    eprintln!(
-                        "proxy rejected CONNECT: {}",
-                        header.lines().next().unwrap_or("")
-                    );
-                }
+                warn!(
+                    target_ip = %target.ip(),
+                    target_port = target.port(),
+                    response = header.lines().next().unwrap_or(""),
+                    "proxy rejected CONNECT"
+                );
                 return Err(io::Error::new(
                     io::ErrorKind::ConnectionRefused,
                     "proxy rejected CONNECT",
@@ -119,26 +125,23 @@ async fn connect_handshake(
     }
 }
 
-pub async fn handle(client: TcpStream, proxy_addr: SocketAddrV4, stats: Arc<Stats>, verbose: bool) {
+/// Handle a single client connection: recover original destination, establish
+/// CONNECT tunnel, and relay data bidirectionally.
+pub async fn handle(client: TcpStream, proxy_addr: SocketAddrV4, stats: Arc<Stats>) {
     stats.conn_open();
-    let ok = relay_inner(client, proxy_addr, &stats, verbose)
-        .await
-        .is_ok();
+    let ok = relay_inner(client, proxy_addr, &stats).await.is_ok();
     stats.conn_close(ok);
 }
 
-async fn relay_inner(
-    client: TcpStream,
-    proxy_addr: SocketAddrV4,
-    stats: &Stats,
-    verbose: bool,
-) -> io::Result<()> {
+async fn relay_inner(client: TcpStream, proxy_addr: SocketAddrV4, stats: &Stats) -> io::Result<()> {
     let orig_dst = get_original_dst(&client)
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "SO_ORIGINAL_DST failed"))?;
 
-    if verbose {
-        eprintln!("{}:{}", orig_dst.ip(), orig_dst.port());
-    }
+    debug!(
+        ip = %orig_dst.ip(),
+        port = orig_dst.port(),
+        "original destination recovered"
+    );
 
     client.set_nodelay(true)?;
     set_keepalive(&client);
@@ -147,11 +150,13 @@ async fn relay_inner(
     proxy.set_nodelay(true)?;
     set_keepalive(&proxy);
 
-    let early_data = connect_handshake(&mut proxy, orig_dst, verbose).await?;
+    let early_data = connect_handshake(&mut proxy, orig_dst).await?;
 
-    if verbose {
-        eprintln!("tunnel up: {}:{}", orig_dst.ip(), orig_dst.port());
-    }
+    info!(
+        ip = %orig_dst.ip(),
+        port = orig_dst.port(),
+        "tunnel established"
+    );
 
     let (mut cr, mut cw) = io::split(client);
     let (mut pr, mut pw) = io::split(proxy);
@@ -184,6 +189,7 @@ async fn relay_inner(
     Ok(())
 }
 
+/// Parse a `host:port` string into its components.
 pub fn parse_host_port(s: &str) -> Option<(String, u16)> {
     let colon = s.rfind(':')?;
     let host = s[..colon].to_string();

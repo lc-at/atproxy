@@ -1,10 +1,17 @@
 // SPDX-License-Identifier: MIT
-use std::process::Command;
+//! iptables rule management for per-UID OUTPUT REDIRECT.
+//!
+//! Applies and cleans up `nat/OUTPUT` rules that redirect TCP connections
+//! from a specific UID to the local transparent-proxy listener, while
+//! exempting loopback and direct-to-proxy traffic.
 
+use std::process::Command;
+use tracing::{debug, error, info, warn};
+
+/// Manages iptables rules for a single UID.
 pub struct Iptables {
     pub uid: u32,
     pub ipv6: bool,
-    pub verbose: bool,
 }
 
 impl Iptables {
@@ -14,13 +21,7 @@ impl Iptables {
 
     fn run(&self, args: &[&str]) -> bool {
         let cmd = self.cmd_name();
-        if self.verbose {
-            eprint!("{cmd}");
-            for a in args {
-                eprint!(" {a}");
-            }
-            eprintln!();
-        }
+        debug!(command = cmd, args = ?args, "executing iptables command");
         let status = Command::new(cmd)
             .args(args)
             .stdout(std::process::Stdio::null())
@@ -29,18 +30,22 @@ impl Iptables {
         match status {
             Ok(s) if s.success() => true,
             Ok(s) => {
-                if !self.verbose {
-                    eprintln!("iptables error (exit {})", s.code().unwrap_or(-1));
-                }
+                warn!(
+                    command = cmd,
+                    exit_code = s.code().unwrap_or(-1),
+                    "iptables command failed"
+                );
                 false
             }
             Err(e) => {
-                eprintln!("iptables exec failed: {e}");
+                error!(command = cmd, error = %e, "iptables exec failed");
                 false
             }
         }
     }
 
+    /// Apply iptables rules: REDIRECT the UID's TCP traffic to `listen_port`,
+    /// with RETURN exemptions for loopback and direct-to-proxy connections.
     pub fn apply(&self, listen_port: u16, proxy_ip: &str, proxy_port: u16) {
         let uid_s = self.uid.to_string();
         let port_s = listen_port.to_string();
@@ -105,9 +110,15 @@ impl Iptables {
             "RETURN",
         ]);
 
-        eprintln!("iptables applied (uid={} → :{})", self.uid, listen_port);
+        info!(
+            uid = self.uid,
+            listen_port,
+            ipv6 = self.ipv6,
+            "iptables rules applied"
+        );
     }
 
+    /// Remove all iptables rules matching this UID from the nat OUTPUT chain.
     pub fn cleanup(&self) {
         let cmd = self.cmd_name();
         let uid_s = self.uid.to_string();
@@ -135,13 +146,18 @@ impl Iptables {
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
                 .status();
-            if status.map_or(false, |s| s.success()) {
+            if status.is_ok_and(|s| s.success()) {
                 removed += 1;
             }
         }
 
         if removed > 0 {
-            eprintln!("Cleaned {removed} rule(s) for uid={} ({cmd})", self.uid);
+            info!(
+                uid = self.uid,
+                removed,
+                ipv6 = self.ipv6,
+                "cleaned iptables rules"
+            );
         }
     }
 }

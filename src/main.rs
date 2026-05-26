@@ -1,7 +1,14 @@
 // SPDX-License-Identifier: MIT
+//! atproxy — Per-app transparent TCP proxy for Android.
+//!
+//! Intercepts TCP connections from a specific Android UID (or package) and
+//! tunnels them through an upstream HTTP CONNECT proxy using iptables OUTPUT
+//! REDIRECT rules and `SO_ORIGINAL_DST` recovery.
+
 mod cli;
 mod iptables;
 mod relay;
+mod resolve;
 mod stats;
 
 use std::sync::Arc;
@@ -9,6 +16,8 @@ use std::sync::Arc;
 use clap::Parser;
 use tokio::net::TcpListener;
 use tokio::signal::unix::{SignalKind, signal};
+use tracing::{error, info};
+use tracing_subscriber::EnvFilter;
 
 use cli::Cli;
 use iptables::Iptables;
@@ -17,6 +26,21 @@ use stats::Stats;
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
+    // Initialize structured logging with timestamps and module paths.
+    // Use RUST_LOG env var to override; default is info (or debug with -v).
+    let default_level = if std::env::args_os().any(|a| a == "-v" || a == "--verbose") {
+        "atproxy=debug"
+    } else {
+        "atproxy=info"
+    };
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_level)),
+        )
+        .with_target(true)
+        .compact()
+        .init();
+
     let cli = Cli::try_parse().unwrap_or_else(|e| {
         // If no args were given at all, show help instead of an error.
         if std::env::args_os().len() <= 1 {
@@ -28,36 +52,8 @@ async fn main() {
         e.exit();
     });
 
-    if cli.clean {
-        let uid = match cli.uid {
-            Some(u) => u,
-            None => {
-                eprintln!("Error: --clean requires a UID argument");
-                std::process::exit(1);
-            }
-        };
-
-        let ip4 = Iptables {
-            uid,
-            ipv6: false,
-            verbose: cli.verbose,
-        };
-
-        let ip6 = Iptables {
-            uid,
-            ipv6: true,
-            verbose: cli.verbose,
-        };
-
-        ip4.cleanup();
-        if cli.ipv6 {
-            ip6.cleanup();
-        }
-
-        return;
-    }
-
-    let uid = match cli.uid {
+    // Resolve UID from either --uid or --filter (mutually exclusive via clap).
+    let uid = match resolve_uid_arg(&cli) {
         Some(u) => u,
         None => {
             <Cli as clap::CommandFactory>::command()
@@ -66,6 +62,18 @@ async fn main() {
             std::process::exit(1);
         }
     };
+
+    if cli.clean {
+        let ip4 = Iptables { uid, ipv6: false };
+        let ip6 = Iptables { uid, ipv6: true };
+
+        ip4.cleanup();
+        if cli.ipv6 {
+            ip6.cleanup();
+        }
+
+        return;
+    }
 
     let proxy_str = match cli.proxy {
         Some(ref s) => s,
@@ -80,7 +88,7 @@ async fn main() {
     let (proxy_host, proxy_port) = match parse_host_port(proxy_str) {
         Some(v) => v,
         None => {
-            eprintln!("Error: bad proxy address: expected host:port");
+            error!("bad proxy address: expected host:port");
             std::process::exit(1);
         }
     };
@@ -88,11 +96,11 @@ async fn main() {
     let proxy_addr: std::net::SocketAddr =
         match tokio::net::lookup_host(format!("{proxy_host}:{proxy_port}")).await {
             Ok(mut addrs) => addrs.next().unwrap_or_else(|| {
-                eprintln!("Error: no addresses for proxy");
+                error!("no addresses resolved for proxy");
                 std::process::exit(1);
             }),
             Err(e) => {
-                eprintln!("Error: cannot resolve proxy address: {e}");
+                error!(proxy_host, proxy_port, error = %e, "cannot resolve proxy address");
                 std::process::exit(1);
             }
         };
@@ -104,22 +112,14 @@ async fn main() {
     let proxy_port_u16 = proxy_addr.port();
 
     if !nix::unistd::geteuid().is_root() {
-        eprintln!("Error: root required. Run with su or sudo.");
+        error!("root required. Run with su or sudo.");
         std::process::exit(1);
     }
 
     let stats = Arc::new(Stats::new());
 
-    let ip4 = Iptables {
-        uid,
-        ipv6: false,
-        verbose: cli.verbose,
-    };
-    let ip6 = Iptables {
-        uid,
-        ipv6: true,
-        verbose: cli.verbose,
-    };
+    let ip4 = Iptables { uid, ipv6: false };
+    let ip6 = Iptables { uid, ipv6: true };
     ip4.apply(cli.port, &proxy_ip_str, proxy_port_u16);
     if cli.ipv6 {
         ip6.apply(cli.port, &proxy_ip_str, proxy_port_u16);
@@ -132,15 +132,17 @@ async fn main() {
         .await
         .expect("bind failed");
 
-    eprintln!(
-        "Listening :{} → {}:{}",
-        cli.port, proxy_ip_str, proxy_port_u16
+    info!(
+        listen_port = cli.port,
+        proxy_ip = proxy_ip_str.as_str(),
+        proxy_port = proxy_port_u16,
+        "listening for redirected connections"
     );
 
     let proxy_addr_v4 = match proxy_addr {
         std::net::SocketAddr::V4(a) => a,
         _ => {
-            eprintln!("Error: only IPv4 proxy addresses supported for CONNECT");
+            error!("only IPv4 proxy addresses supported for CONNECT");
             std::process::exit(1);
         }
     };
@@ -152,11 +154,10 @@ async fn main() {
                     Ok((client, _peer)) => {
                         let stats = stats.clone();
                         let proxy = proxy_addr_v4;
-                        let verbose = cli.verbose;
-                        tokio::spawn(relay::handle(client, proxy, stats, verbose));
+                        tokio::spawn(relay::handle(client, proxy, stats));
                     }
                     Err(e) => {
-                        eprintln!("accept error: {e}");
+                        error!(error = %e, "accept error");
                     }
                 }
             }
@@ -165,22 +166,36 @@ async fn main() {
         }
     }
 
-    eprintln!("\nShutting down…");
-    eprintln!("Stats: {stats}");
+    info!("shutting down");
+    info!(
+        total = stats.total(),
+        active = stats.active(),
+        failed = stats.failed(),
+        bytes_up_kb = stats.bytes_up_kb(),
+        bytes_down_kb = stats.bytes_down_kb(),
+        "final stats"
+    );
 
-    eprintln!("Cleaning iptables…");
-    let ip4 = Iptables {
-        uid,
-        ipv6: false,
-        verbose: cli.verbose,
-    };
-    let ip6 = Iptables {
-        uid,
-        ipv6: true,
-        verbose: cli.verbose,
-    };
+    info!("cleaning iptables rules");
+    let ip4 = Iptables { uid, ipv6: false };
+    let ip6 = Iptables { uid, ipv6: true };
     ip4.cleanup();
     if cli.ipv6 {
         ip6.cleanup();
+    }
+}
+
+/// Resolve the effective UID from CLI arguments.
+///
+/// Accepts either `--uid <n>` (direct) or `--filter <package>` (resolved via
+/// `pm list packages -U`). Returns `None` if neither is provided.
+fn resolve_uid_arg(cli: &Cli) -> Option<u32> {
+    match (cli.uid, &cli.filter) {
+        (Some(u), _) => Some(u),
+        (_, Some(pkg)) => {
+            let uid = resolve::resolve_uid(pkg)?;
+            Some(uid)
+        }
+        (None, None) => None,
     }
 }

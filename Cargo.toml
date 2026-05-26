@@ -9,6 +9,8 @@ tokio = { version = "1", features = ["rt", "net", "macros", "signal", "io-util",
 nix = { version = "0.30", features = ["net", "socket", "signal", "user"] }
 libc = "0.2"
 clap = { version = "4", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [profile.release]
 opt-level = "z"
