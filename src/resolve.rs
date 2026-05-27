@@ -53,10 +53,15 @@ fn parse_uid_from_output(package: &str, stdout: &str) -> Option<u32> {
             continue;
         }
         if let Some(uid_part) = rest[space + 1..].strip_prefix("uid:")
-            && let Ok(uid) = uid_part.trim().parse::<u32>()
         {
-            debug!(package, uid, "resolved package to UID");
-            return Some(uid);
+            // Android may return multiple comma-separated UIDs
+            // (e.g. "uid:10302,1010302" for real UID + isolated process UID).
+            // Take the first one as the primary UID.
+            let first_uid = uid_part.trim().split(',').next().unwrap_or(uid_part.trim());
+            if let Ok(uid) = first_uid.parse::<u32>() {
+                debug!(package, uid, "resolved package to UID");
+                return Some(uid);
+            }
         }
     }
 
@@ -136,6 +141,16 @@ mod tests {
     fn test_parse_uid_not_found() {
         let out = "package:com.example.app uid:10188\n";
         assert_eq!(parse_uid_from_output("com.nonexistent", out), None);
+    }
+
+    #[test]
+    fn test_parse_uid_multi_uid_field() {
+        // Android can return "uid:10302,1010302" (real UID + isolated process UID).
+        let out = "package:com.grabtaxi.passenger uid:10302,1010302\n";
+        assert_eq!(
+            parse_uid_from_output("com.grabtaxi.passenger", out),
+            Some(10302)
+        );
     }
 
     #[test]
