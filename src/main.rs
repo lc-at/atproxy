@@ -27,7 +27,7 @@ use cli::Cli;
 use exclude::ExcludeList;
 use iptables::Iptables;
 use relay::parse_host_port;
-use resolve::resolve_proxy_addr;
+use resolve::{DEFAULT_DNS_SERVERS, parse_resolv_conf, resolve_proxy_addr};
 use stats::Stats;
 
 #[tokio::main(flavor = "current_thread")]
@@ -93,11 +93,32 @@ async fn main() {
     };
 
     // Resolve the proxy host. Accept either an IPv4 literal or a DNS hostname.
-    // Filter the iterator to IPv4 only — if the resolver returns IPv6 first
-    // (which depends on getaddrinfo/RFC 3484 policy), the previous code would
-    // error out later with "only IPv4 proxy addresses supported", which is
-    // confusing when the user typed a perfectly good hostname.
-    let proxy_addr = match resolve_proxy_addr(&proxy_host, proxy_port).await {
+    // Two-stage: (1) system resolver, (2) built-in UDP DNS client. Stage 2 is
+    // necessary on Android where musl cannot reach the NetD daemon.
+    let dns_servers: Vec<std::net::Ipv4Addr> = if cli.dns.is_empty() {
+        // No explicit override: try /etc/resolv.conf, fall back to defaults.
+        let from_file = parse_resolv_conf("/etc/resolv.conf");
+        if from_file.is_empty() {
+            DEFAULT_DNS_SERVERS.to_vec()
+        } else {
+            from_file
+        }
+    } else {
+        // Validate explicit --dns entries.
+        let mut servers = Vec::with_capacity(cli.dns.len());
+        for s in &cli.dns {
+            match s.parse() {
+                Ok(ip) => servers.push(ip),
+                Err(_) => {
+                    error!(server = s, "--dns entry is not a valid IPv4 address");
+                    std::process::exit(1);
+                }
+            }
+        }
+        servers
+    };
+
+    let proxy_addr = match resolve_proxy_addr(&proxy_host, proxy_port, &dns_servers).await {
         Ok(addr) => addr,
         Err(e) => {
             error!(proxy_host, proxy_port, error = %e, "cannot resolve proxy address");

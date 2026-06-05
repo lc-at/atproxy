@@ -44,4 +44,17 @@ pub struct Cli {
     /// Examples: `--exclude 10.0.0.0/8`, `--exclude 1.1.1.1,8.8.8.8`.
     #[arg(long, value_name = "IP[/MASK]", value_delimiter = ',')]
     pub exclude: Vec<String>,
+
+    /// DNS server(s) to use for resolving the upstream proxy hostname.
+    ///
+    /// Only used as a fallback when the system resolver (`getaddrinfo`)
+    /// fails or returns no IPv4 results — necessary on Android where musl's
+    /// libc has no path to the system's NetD daemon and `/etc/resolv.conf`
+    /// typically doesn't exist.
+    ///
+    /// May be specified multiple times and/or as a comma-separated list.
+    /// Defaults: read from `/etc/resolv.conf` if present, else
+    /// `1.1.1.1,8.8.8.8,1.0.0.1,8.8.4.4`.
+    #[arg(long, value_name = "IP", value_delimiter = ',')]
+    pub dns: Vec<String>,
 }
