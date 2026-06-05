@@ -27,6 +27,7 @@ use cli::Cli;
 use exclude::ExcludeList;
 use iptables::Iptables;
 use relay::parse_host_port;
+use resolve::resolve_proxy_addr;
 use stats::Stats;
 
 #[tokio::main(flavor = "current_thread")]
@@ -96,23 +97,13 @@ async fn main() {
     // (which depends on getaddrinfo/RFC 3484 policy), the previous code would
     // error out later with "only IPv4 proxy addresses supported", which is
     // confusing when the user typed a perfectly good hostname.
-    let proxy_addr: std::net::SocketAddr =
-        match tokio::net::lookup_host(format!("{proxy_host}:{proxy_port}")).await {
-            Ok(addrs) => addrs
-                .filter(|a| a.is_ipv4())
-                .next()
-                .unwrap_or_else(|| {
-                    error!(
-                        proxy_host,
-                        "no IPv4 address resolved for proxy (hostnames that resolve to IPv6-only are not supported)"
-                    );
-                    std::process::exit(1);
-                }),
-            Err(e) => {
-                error!(proxy_host, proxy_port, error = %e, "cannot resolve proxy address");
-                std::process::exit(1);
-            }
-        };
+    let proxy_addr = match resolve_proxy_addr(&proxy_host, proxy_port).await {
+        Ok(addr) => addr,
+        Err(e) => {
+            error!(proxy_host, proxy_port, error = %e, "cannot resolve proxy address");
+            std::process::exit(1);
+        }
+    };
 
     let proxy_ip_str = proxy_addr.ip().to_string();
     let proxy_port_u16 = proxy_addr.port();
@@ -160,10 +151,7 @@ async fn main() {
         "listening for redirected connections"
     );
 
-    let std::net::SocketAddr::V4(proxy_addr_v4) = proxy_addr else {
-        error!("only IPv4 proxy addresses supported for CONNECT");
-        std::process::exit(1);
-    };
+    let proxy_addr_v4 = proxy_addr;
 
     loop {
         tokio::select! {
