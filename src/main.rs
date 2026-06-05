@@ -27,7 +27,6 @@ use cli::Cli;
 use exclude::ExcludeList;
 use iptables::Iptables;
 use relay::parse_host_port;
-use resolve::resolve_proxy_addr;
 use stats::Stats;
 
 #[tokio::main(flavor = "current_thread")]
@@ -79,7 +78,7 @@ async fn main() {
     }
 
     let Some((proxy_host, proxy_port)) = parse_host_port(&proxy_str) else {
-        error!("bad proxy address: expected host:port (e.g. proxy.example.com:8080 or 1.2.3.4:8080)");
+        error!("bad proxy address: expected IPv4:port (e.g. 1.2.3.4:8080)");
         std::process::exit(1);
     };
 
@@ -92,18 +91,24 @@ async fn main() {
         }
     };
 
-    // Resolve the proxy host. Accept either an IPv4 literal or a DNS hostname.
-    // Filter the iterator to IPv4 only — if the resolver returns IPv6 first
-    // (which depends on getaddrinfo/RFC 3484 policy), the previous code would
-    // error out later with "only IPv4 proxy addresses supported", which is
-    // confusing when the user typed a perfectly good hostname.
-    let proxy_addr = match resolve_proxy_addr(&proxy_host, proxy_port).await {
-        Ok(addr) => addr,
-        Err(e) => {
-            error!(proxy_host, proxy_port, error = %e, "cannot resolve proxy address");
+    // Proxy address must be an IPv4 literal. DNS hostnames are not accepted —
+    // on Android+musl the system resolver is unreliable (often only consults
+    // /etc/hosts) and silently resolving to a stale/wrong IP is worse than
+    // failing fast. Users who need a hostname should add it to /etc/hosts or
+    // pass the IP directly.
+    let proxy_ip: std::net::Ipv4Addr = match proxy_host.parse() {
+        Ok(ip) => ip,
+        Err(_) => {
+            error!(
+                proxy_host,
+                "proxy must be an IPv4 literal, not a hostname (got {:?}); \
+                 DNS resolution is intentionally disabled — pass the IP directly",
+                proxy_host,
+            );
             std::process::exit(1);
         }
     };
+    let proxy_addr = std::net::SocketAddrV4::new(proxy_ip, proxy_port);
 
     let proxy_ip_str = proxy_addr.ip().to_string();
     let proxy_port_u16 = proxy_addr.port();

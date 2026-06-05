@@ -13,10 +13,12 @@ pub struct Cli {
     #[arg(value_name = "TARGET")]
     pub target: Option<String>,
 
-    /// Upstream HTTP proxy address (host:port).
+    /// Upstream HTTP proxy address (IPv4:port).
     ///
-    /// Host may be an IPv4 address or a DNS hostname. Hostnames are resolved
-    /// at startup via the system resolver and the first A record is used.
+    /// Must be an IPv4 literal (e.g. `1.2.3.4:8080`). DNS hostnames are not
+    /// resolved — on Android the system resolver is unreliable under musl,
+    /// so atproxy requires the IP explicitly. If your proxy only has a
+    /// hostname, add an entry to `/etc/hosts` on the device first.
     #[arg(value_name = "PROXY")]
     pub proxy: Option<String>,
 
