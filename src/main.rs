@@ -4,8 +4,12 @@
 //! Intercepts TCP connections from specific Android UIDs (or a package) and
 //! tunnels them through an upstream HTTP CONNECT proxy using iptables OUTPUT
 //! REDIRECT rules and `SO_ORIGINAL_DST` recovery.
+//!
+//! Destinations matching `--exclude` entries bypass the upstream proxy and
+//! are relayed directly.
 
 mod cli;
+mod exclude;
 mod iptables;
 mod relay;
 mod resolve;
@@ -20,6 +24,7 @@ use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 use cli::Cli;
+use exclude::ExcludeList;
 use iptables::Iptables;
 use relay::parse_host_port;
 use stats::Stats;
@@ -73,16 +78,36 @@ async fn main() {
     }
 
     let Some((proxy_host, proxy_port)) = parse_host_port(&proxy_str) else {
-        error!("bad proxy address: expected host:port");
+        error!("bad proxy address: expected host:port (e.g. proxy.example.com:8080 or 1.2.3.4:8080)");
         std::process::exit(1);
     };
 
+    // Parse the exclude list early so a bad value fails fast.
+    let excludes = match ExcludeList::from_strs(cli.exclude.iter().map(String::as_str)) {
+        Ok(l) => Arc::new(l),
+        Err(e) => {
+            error!(error = %e, "invalid --exclude entry");
+            std::process::exit(1);
+        }
+    };
+
+    // Resolve the proxy host. Accept either an IPv4 literal or a DNS hostname.
+    // Filter the iterator to IPv4 only — if the resolver returns IPv6 first
+    // (which depends on getaddrinfo/RFC 3484 policy), the previous code would
+    // error out later with "only IPv4 proxy addresses supported", which is
+    // confusing when the user typed a perfectly good hostname.
     let proxy_addr: std::net::SocketAddr =
         match tokio::net::lookup_host(format!("{proxy_host}:{proxy_port}")).await {
-            Ok(mut addrs) => addrs.next().unwrap_or_else(|| {
-                error!("no addresses resolved for proxy");
-                std::process::exit(1);
-            }),
+            Ok(addrs) => addrs
+                .filter(|a| a.is_ipv4())
+                .next()
+                .unwrap_or_else(|| {
+                    error!(
+                        proxy_host,
+                        "no IPv4 address resolved for proxy (hostnames that resolve to IPv6-only are not supported)"
+                    );
+                    std::process::exit(1);
+                }),
             Err(e) => {
                 error!(proxy_host, proxy_port, error = %e, "cannot resolve proxy address");
                 std::process::exit(1);
@@ -128,8 +153,10 @@ async fn main() {
     info!(
         listen_port = cli.port,
         uids = ?uids,
+        proxy_host = proxy_host.as_str(),
         proxy_ip = proxy_ip_str.as_str(),
         proxy_port = proxy_port_u16,
+        excluded = excludes.len(),
         "listening for redirected connections"
     );
 
@@ -144,8 +171,9 @@ async fn main() {
                 match accept_result {
                     Ok((client, _peer)) => {
                         let stats = stats.clone();
+                        let excludes = excludes.clone();
                         let proxy = proxy_addr_v4;
-                        tokio::spawn(relay::handle(client, proxy, stats));
+                        tokio::spawn(relay::handle(client, proxy, stats, excludes));
                     }
                     Err(e) => {
                         error!(error = %e, "accept error");
