@@ -144,7 +144,6 @@ impl Iptables {
     /// Remove all iptables rules matching this UID from the nat OUTPUT chain.
     pub fn cleanup(&self) {
         let cmd = self.cmd_name();
-        let uid_s = self.uid.to_string();
 
         let Ok(output) = Command::new(cmd)
             .args(["-t", "nat", "-S", "OUTPUT"])
@@ -157,7 +156,10 @@ impl Iptables {
         let mut removed = 0u32;
 
         for line in rules.lines() {
-            if !line.contains(&uid_s) || !line.contains("--uid-owner") {
+            // Token-level match: `--uid-owner 1000` must not accidentally
+            // match a rule for UID 10000 / 21000 (which the previous
+            // `line.contains(&uid_s)` substring check did).
+            if !rule_matches_uid(line, self.uid) {
                 continue;
             }
             let delete_rule = line.replace("-A ", "-D ");
@@ -188,5 +190,79 @@ impl Iptables {
                 "cleaned iptables rules"
             );
         }
+    }
+}
+
+/// Return `true` iff `line` is an iptables rule whose `--uid-owner` argument
+/// equals `uid` exactly. Token-based to avoid substring false positives
+/// (e.g. UID `1000` previously matched against `--uid-owner 10000`).
+fn rule_matches_uid(line: &str, uid: u32) -> bool {
+    let uid_s = uid.to_string();
+    let mut iter = line.split_whitespace();
+    while let Some(tok) = iter.next() {
+        if tok == "--uid-owner" {
+            if let Some(val) = iter.next() {
+                if val == uid_s {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_rule_matches_uid_exact() {
+        assert!(rule_matches_uid(
+            "-A OUTPUT -p tcp -m owner --uid-owner 1000 -j REDIRECT --to-port 5280",
+            1000
+        ));
+    }
+
+    #[test]
+    fn test_rule_matches_uid_no_substring_false_positive() {
+        // Regression: the old `line.contains(&uid_s)` matched any rule whose
+        // text mentioned the UID digits anywhere. UID 1000 must NOT match
+        // rules for 10000, 11000, 21000, 10001, etc.
+        assert!(!rule_matches_uid(
+            "-A OUTPUT -p tcp -m owner --uid-owner 10000 -j REDIRECT --to-port 5280",
+            1000
+        ));
+        assert!(!rule_matches_uid(
+            "-A OUTPUT -p tcp -m owner --uid-owner 21000 -j REDIRECT --to-port 5280",
+            1000
+        ));
+        assert!(!rule_matches_uid(
+            "-A OUTPUT -p tcp -m owner --uid-owner 10001 -j REDIRECT --to-port 5280",
+            1000
+        ));
+    }
+
+    #[test]
+    fn test_rule_matches_uid_no_owner_flag() {
+        // Rules without --uid-owner should not match.
+        assert!(!rule_matches_uid(
+            "-A OUTPUT -p tcp -j REDIRECT --to-port 5280",
+            1000
+        ));
+    }
+
+    #[test]
+    fn test_rule_matches_uid_with_other_numbers_present() {
+        // UID 1000 should match even when the rule contains other numbers
+        // like --to-port 5280, and should NOT match a rule with port 1000
+        // but a different uid-owner.
+        assert!(rule_matches_uid(
+            "-A OUTPUT -p tcp -m owner --uid-owner 1000 -j REDIRECT --to-port 5280",
+            1000
+        ));
+        assert!(!rule_matches_uid(
+            "-A OUTPUT -p tcp -m owner --uid-owner 9999 -j REDIRECT --to-port 1000",
+            1000
+        ));
     }
 }
