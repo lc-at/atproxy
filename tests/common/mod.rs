@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: MIT
+#![allow(dead_code)]
 use std::fs;
 use std::net::SocketAddr;
 use std::os::unix::fs::PermissionsExt;

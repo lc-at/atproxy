@@ -159,10 +159,10 @@ impl Iptables {
             return None;
         }
         let parsed: std::net::IpAddr = proxy_ip.parse().ok()?;
-        let family_matches = match (self.ipv6, parsed) {
-            (false, std::net::IpAddr::V4(_)) | (true, std::net::IpAddr::V6(_)) => true,
-            _ => false,
-        };
+        let family_matches = matches!(
+            (self.ipv6, parsed),
+            (false, std::net::IpAddr::V4(_)) | (true, std::net::IpAddr::V6(_))
+        );
         if family_matches {
             Some(proxy_ip)
         } else {
@@ -229,12 +229,10 @@ fn rule_matches_uid(line: &str, uid: u32) -> bool {
     let uid_s = uid.to_string();
     let mut iter = line.split_whitespace();
     while let Some(tok) = iter.next() {
-        if tok == "--uid-owner" {
-            if let Some(val) = iter.next() {
-                if val == uid_s {
-                    return true;
-                }
-            }
+        if tok == "--uid-owner"
+            && iter.next().is_some_and(|val| val == uid_s)
+        {
+            return true;
         }
     }
     false

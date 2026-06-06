@@ -9,14 +9,31 @@
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::os::unix::io::AsRawFd;
 use std::sync::Arc;
+use std::time::Duration;
 
 use nix::sys::socket::{getsockopt, sockopt};
 use tokio::io::{self, AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+use tokio::time::timeout;
 use tracing::{debug, info, warn};
 
 use crate::exclude::ExcludeList;
 use crate::stats::Stats;
+
+/// Timeout for outbound TCP connects (to upstream proxy or to a directly
+/// passthrough destination). Linux's default SYN-retry schedule is ~130s on
+/// Android, which is far too long to hold an atproxy task open for a single
+/// dead destination — bound it explicitly.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Timeout for reading the upstream proxy's CONNECT response. Without this, a
+/// proxy that accepts the TCP handshake but never sends data would leave the
+/// relay task hung indefinitely.
+const CONNECT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Buffer cap for the CONNECT response. RFC 7230 §3.2.5 recommends servers
+/// cap header field lengths; we treat a response exceeding this as malformed.
+const CONNECT_RESPONSE_MAX: usize = 8192;
 
 /// Recover the original destination address from a redirected socket.
 ///
@@ -108,6 +125,10 @@ fn parse_status_code(header: &str) -> Option<u16> {
 ///
 /// The CONNECT request line is built from `target`: IPv6 literals are emitted
 /// in bracketed form (`[2001:db8::1]:443`) so the proxy can parse the port.
+///
+/// Bounded by [`CONNECT_HANDSHAKE_TIMEOUT`]: if the proxy accepts the TCP
+/// connection but does not send a complete response within 15s, the handshake
+/// is aborted so the relay task doesn't hang indefinitely.
 async fn connect_handshake(proxy: &mut TcpStream, target: SocketAddr) -> io::Result<Vec<u8>> {
     let host_port = format_target_for_connect(target);
     let req = format!(
@@ -115,45 +136,55 @@ async fn connect_handshake(proxy: &mut TcpStream, target: SocketAddr) -> io::Res
     );
     proxy.write_all(req.as_bytes()).await?;
 
-    let mut buf = vec![0u8; 4096];
+    let mut buf = vec![0u8; CONNECT_RESPONSE_MAX];
     let mut total = 0;
 
-    loop {
-        if total >= buf.len() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "CONNECT response too large",
-            ));
-        }
-        let n = proxy.read(&mut buf[total..]).await?;
-        if n == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "proxy EOF during CONNECT",
-            ));
-        }
-        total += n;
-
-        if let Some(hdr_end) = find_header_end(&buf[..total]) {
-            let header = std::str::from_utf8(&buf[..hdr_end])
-                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "non-UTF8 response"))?;
-
-            let code = parse_status_code(header).unwrap_or(0);
-            if code != 200 {
-                warn!(
-                    target = %host_port,
-                    status_code = code,
-                    response = header.lines().next().unwrap_or(""),
-                    "proxy rejected CONNECT"
-                );
+    let read_fut = async {
+        loop {
+            if total >= buf.len() {
                 return Err(io::Error::new(
-                    io::ErrorKind::ConnectionRefused,
-                    "proxy rejected CONNECT",
+                    io::ErrorKind::InvalidData,
+                    "CONNECT response too large",
                 ));
             }
+            let n = proxy.read(&mut buf[total..]).await?;
+            if n == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "proxy EOF during CONNECT",
+                ));
+            }
+            total += n;
 
-            return Ok(buf[hdr_end..total].to_vec());
+            if let Some(hdr_end) = find_header_end(&buf[..total]) {
+                let header = std::str::from_utf8(&buf[..hdr_end])
+                    .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "non-UTF8 response"))?;
+
+                let code = parse_status_code(header).unwrap_or(0);
+                if code != 200 {
+                    warn!(
+                        target = %host_port,
+                        status_code = code,
+                        response = header.lines().next().unwrap_or(""),
+                        "proxy rejected CONNECT"
+                    );
+                    return Err(io::Error::new(
+                        io::ErrorKind::ConnectionRefused,
+                        "proxy rejected CONNECT",
+                    ));
+                }
+
+                return Ok(buf[hdr_end..total].to_vec());
+            }
         }
+    };
+
+    match timeout(CONNECT_HANDSHAKE_TIMEOUT, read_fut).await {
+        Ok(inner) => inner,
+        Err(_) => Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "proxy CONNECT response timed out",
+        )),
     }
 }
 
@@ -219,7 +250,9 @@ async fn relay_direct(
     client.set_nodelay(true)?;
     set_keepalive(&client);
 
-    let upstream = TcpStream::connect(target).await?;
+    let upstream = timeout(CONNECT_TIMEOUT, TcpStream::connect(target))
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "direct connect timed out"))??;
     upstream.set_nodelay(true)?;
     set_keepalive(&upstream);
 
@@ -242,7 +275,9 @@ async fn relay_via_proxy(
     client.set_nodelay(true)?;
     set_keepalive(&client);
 
-    let mut proxy = TcpStream::connect(proxy_addr).await?;
+    let mut proxy = timeout(CONNECT_TIMEOUT, TcpStream::connect(proxy_addr))
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "proxy connect timed out"))??;
     proxy.set_nodelay(true)?;
     set_keepalive(&proxy);
 
