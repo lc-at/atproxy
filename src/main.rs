@@ -78,7 +78,7 @@ async fn main() {
     }
 
     let Some((proxy_host, proxy_port)) = parse_host_port(&proxy_str) else {
-        error!("bad proxy address: expected IPv4:port (e.g. 1.2.3.4:8080)");
+        error!("bad proxy address: expected IP:port (e.g. 1.2.3.4:8080 or [::1]:8080)");
         std::process::exit(1);
     };
 
@@ -91,24 +91,27 @@ async fn main() {
         }
     };
 
-    // Proxy address must be an IPv4 literal. DNS hostnames are not accepted —
-    // on Android+musl the system resolver is unreliable (often only consults
-    // /etc/hosts) and silently resolving to a stale/wrong IP is worse than
-    // failing fast. Users who need a hostname should add it to /etc/hosts or
-    // pass the IP directly.
-    let proxy_ip: std::net::Ipv4Addr = match proxy_host.parse() {
+    // Proxy address must be an IPv4 or IPv6 literal. DNS hostnames are not
+    // accepted — on Android+musl the system resolver is unreliable (often
+    // only consults /etc/hosts) and silently resolving to a stale/wrong IP
+    // is worse than failing fast. Users who need a hostname should add it
+    // to /etc/hosts or pass the IP directly.
+    //
+    // parse_host_port strips the brackets from `[::1]:8080` so we can parse
+    // the host as a plain IpAddr.
+    let proxy_ip: std::net::IpAddr = match proxy_host.trim_start_matches('[').trim_end_matches(']').parse() {
         Ok(ip) => ip,
         Err(_) => {
             error!(
                 proxy_host,
-                "proxy must be an IPv4 literal, not a hostname (got {:?}); \
+                "proxy must be an IPv4 or IPv6 literal, not a hostname (got {:?}); \
                  DNS resolution is intentionally disabled — pass the IP directly",
                 proxy_host,
             );
             std::process::exit(1);
         }
     };
-    let proxy_addr = std::net::SocketAddrV4::new(proxy_ip, proxy_port);
+    let proxy_addr = std::net::SocketAddr::new(proxy_ip, proxy_port);
 
     let proxy_ip_str = proxy_addr.ip().to_string();
     let proxy_port_u16 = proxy_addr.port();
@@ -142,9 +145,26 @@ async fn main() {
     let mut sigterm = signal(SignalKind::terminate()).expect("sigterm handler");
     let mut sigint = signal(SignalKind::interrupt()).expect("sigint handler");
 
-    let listener = TcpListener::bind(format!("0.0.0.0:{}", cli.port))
-        .await
-        .expect("bind failed");
+    // Bind a dual-stack IPv6 socket. On Linux this accepts both v4 and v6
+    // connections by default (IPV6_V6ONLY=0), which is exactly what we need:
+    // iptables-redirected v4 traffic and ip6tables-redirected v6 traffic
+    // both arrive on the same port.
+    //
+    // If the kernel refuses dual-stack (uncommon), fall back to IPv4-only —
+    // IPv6 traffic will then simply not be proxied.
+    let listener = match TcpListener::bind(format!("[::]:{}", cli.port)).await {
+        Ok(l) => l,
+        Err(e) => {
+            warn!(
+                error = %e,
+                port = cli.port,
+                "failed to bind IPv6 dual-stack listener; falling back to IPv4-only"
+            );
+            TcpListener::bind(format!("0.0.0.0:{}", cli.port))
+                .await
+                .expect("bind failed")
+        }
+    };
 
     info!(
         listen_port = cli.port,

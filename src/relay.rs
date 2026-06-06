@@ -6,11 +6,11 @@
 //! origin (passthrough). Otherwise the connection is tunneled through the
 //! upstream proxy via an HTTP CONNECT handshake.
 
-use std::net::SocketAddrV4;
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::os::unix::io::AsRawFd;
 use std::sync::Arc;
 
-use nix::sys::socket::{getsockopt, sockopt::OriginalDst};
+use nix::sys::socket::{getsockopt, sockopt};
 use tokio::io::{self, AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tracing::{debug, info, warn};
@@ -19,12 +19,41 @@ use crate::exclude::ExcludeList;
 use crate::stats::Stats;
 
 /// Recover the original destination address from a redirected socket.
-pub fn get_original_dst(sock: &TcpStream) -> Option<SocketAddrV4> {
-    use std::net::Ipv4Addr;
-    let addr = getsockopt(sock, OriginalDst).ok()?;
+///
+/// Tries IPv4 `SO_ORIGINAL_DST` first; if that returns nothing (the socket
+/// was redirected by ip6tables, not iptables), falls back to IPv6
+/// `IP6T_SO_ORIGINAL_DST`. Returns the family-correct `SocketAddr`.
+///
+/// Returns `None` if neither sockopt succeeds — typically meaning the socket
+/// was not redirected at all (e.g. someone connected to the listener
+/// directly without going through the iptables OUTPUT chain).
+pub fn get_original_dst(sock: &TcpStream) -> Option<SocketAddr> {
+    if let Some(v4) = get_original_dst_v4(sock) {
+        return Some(SocketAddr::V4(v4));
+    }
+    get_original_dst_v6(sock).map(SocketAddr::V6)
+}
+
+fn get_original_dst_v4(sock: &TcpStream) -> Option<std::net::SocketAddrV4> {
+    let addr = getsockopt(sock, sockopt::OriginalDst).ok()?;
     let ip = Ipv4Addr::from(u32::from_be(addr.sin_addr.s_addr));
     let port = u16::from_be(addr.sin_port);
-    Some(SocketAddrV4::new(ip, port))
+    Some(std::net::SocketAddrV4::new(ip, port))
+}
+
+fn get_original_dst_v6(sock: &TcpStream) -> Option<std::net::SocketAddrV6> {
+    let addr = getsockopt(sock, sockopt::Ip6tOriginalDst).ok()?;
+    let ip = Ipv6Addr::from(addr.sin6_addr.s6_addr);
+    let port = u16::from_be(addr.sin6_port);
+    // sin6_flowinfo and sin6_scope_id are preserved by the kernel for
+    // redirected sockets but typically zero for global unicast destinations;
+    // we keep them as-is for correctness.
+    Some(std::net::SocketAddrV6::new(
+        ip,
+        port,
+        u32::from_be(addr.sin6_flowinfo),
+        u32::from_be(addr.sin6_scope_id),
+    ))
 }
 
 /// Set a single integer socket option via libc `setsockopt`.
@@ -76,13 +105,13 @@ fn parse_status_code(header: &str) -> Option<u16> {
 }
 
 /// Perform the HTTP CONNECT handshake with the upstream proxy.
-async fn connect_handshake(proxy: &mut TcpStream, target: SocketAddrV4) -> io::Result<Vec<u8>> {
+///
+/// The CONNECT request line is built from `target`: IPv6 literals are emitted
+/// in bracketed form (`[2001:db8::1]:443`) so the proxy can parse the port.
+async fn connect_handshake(proxy: &mut TcpStream, target: SocketAddr) -> io::Result<Vec<u8>> {
+    let host_port = format_target_for_connect(target);
     let req = format!(
-        "CONNECT {}:{} HTTP/1.1\r\nHost: {}:{}\r\n\r\n",
-        target.ip(),
-        target.port(),
-        target.ip(),
-        target.port(),
+        "CONNECT {host_port} HTTP/1.1\r\nHost: {host_port}\r\n\r\n",
     );
     proxy.write_all(req.as_bytes()).await?;
 
@@ -112,8 +141,7 @@ async fn connect_handshake(proxy: &mut TcpStream, target: SocketAddrV4) -> io::R
             let code = parse_status_code(header).unwrap_or(0);
             if code != 200 {
                 warn!(
-                    target_ip = %target.ip(),
-                    target_port = target.port(),
+                    target = %host_port,
                     status_code = code,
                     response = header.lines().next().unwrap_or(""),
                     "proxy rejected CONNECT"
@@ -129,11 +157,24 @@ async fn connect_handshake(proxy: &mut TcpStream, target: SocketAddrV4) -> io::R
     }
 }
 
+/// Format a `SocketAddr` for the CONNECT request-line.
+///
+/// - IPv4 → `1.2.3.4:443`
+/// - IPv6 → `[2001:db8::1]:443`
+///
+/// RFC 7231 §4.3.6 + RFC 3986 §3.2.2: host:port with IPv6 in brackets.
+fn format_target_for_connect(addr: SocketAddr) -> String {
+    match addr {
+        SocketAddr::V4(v4) => format!("{}:{}", v4.ip(), v4.port()),
+        SocketAddr::V6(v6) => format!("[{}]:{}", v6.ip(), v6.port()),
+    }
+}
+
 /// Handle a single client connection: recover original destination, then
 /// either relay directly (if excluded) or establish a CONNECT tunnel.
 pub async fn handle(
     client: TcpStream,
-    proxy_addr: SocketAddrV4,
+    proxy_addr: SocketAddr,
     stats: Arc<Stats>,
     excludes: Arc<ExcludeList>,
 ) {
@@ -144,14 +185,14 @@ pub async fn handle(
 
 async fn relay_inner(
     client: TcpStream,
-    proxy_addr: SocketAddrV4,
+    proxy_addr: SocketAddr,
     stats: &Stats,
     excludes: &ExcludeList,
 ) -> io::Result<()> {
     let orig_dst = get_original_dst(&client)
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "SO_ORIGINAL_DST failed"))?;
 
-    if excludes.contains(*orig_dst.ip()) {
+    if excludes.contains(orig_dst.ip()) {
         debug!(
             ip = %orig_dst.ip(),
             port = orig_dst.port(),
@@ -172,7 +213,7 @@ async fn relay_inner(
 /// Relay directly to the destination, bypassing the upstream proxy.
 async fn relay_direct(
     client: TcpStream,
-    target: SocketAddrV4,
+    target: SocketAddr,
     stats: &Stats,
 ) -> io::Result<()> {
     client.set_nodelay(true)?;
@@ -194,8 +235,8 @@ async fn relay_direct(
 /// Establish a CONNECT tunnel through the upstream proxy and relay.
 async fn relay_via_proxy(
     mut client: TcpStream,
-    proxy_addr: SocketAddrV4,
-    orig_dst: SocketAddrV4,
+    proxy_addr: SocketAddr,
+    orig_dst: SocketAddr,
     stats: &Stats,
 ) -> io::Result<()> {
     client.set_nodelay(true)?;
@@ -306,6 +347,26 @@ mod tests {
             parse_host_port("[::1]:8080"),
             Some(("[::1]".into(), 8080))
         );
+    }
+
+    // ---------- format_target_for_connect ----------
+
+    #[test]
+    fn test_format_target_v4() {
+        let addr: SocketAddr = "1.2.3.4:80".parse().unwrap();
+        assert_eq!(format_target_for_connect(addr), "1.2.3.4:80");
+    }
+
+    #[test]
+    fn test_format_target_v6_bracketed() {
+        let addr: SocketAddr = "[2001:db8::1]:443".parse().unwrap();
+        assert_eq!(format_target_for_connect(addr), "[2001:db8::1]:443");
+    }
+
+    #[test]
+    fn test_format_target_loopback_v6() {
+        let addr: SocketAddr = "[::1]:8080".parse().unwrap();
+        assert_eq!(format_target_for_connect(addr), "[::1]:8080");
     }
 
     // ---------- find_header_end ----------
