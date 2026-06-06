@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: MIT
+#![allow(dead_code)]
 use std::fs;
 use std::net::SocketAddr;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
+use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -31,6 +33,25 @@ pub async fn echo_server(port: u16) -> (SocketAddr, JoinHandle<()>) {
     (addr, handle)
 }
 
+/// Like [`echo_server`] but binds to `0.0.0.0`, so it accepts connections
+/// to any of the machine's IPs (including dummy IPs added to `lo`).
+#[allow(dead_code)]
+pub async fn echo_server_any(port: u16) -> (SocketAddr, JoinHandle<()>) {
+    let listener = TcpListener::bind(("0.0.0.0", port)).await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let handle = tokio::spawn(async move {
+        loop {
+            if let Ok((sock, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let (mut r, mut w) = io::split(sock);
+                    let _ = io::copy(&mut r, &mut w).await;
+                });
+            }
+        }
+    });
+    (addr, handle)
+}
+
 /// CONNECT proxy: parses CONNECT requests, connects to origin, relays.
 pub async fn connect_proxy(port: u16) -> (SocketAddr, JoinHandle<()>) {
     let listener = TcpListener::bind(("127.0.0.1", port)).await.unwrap();
@@ -43,6 +64,92 @@ pub async fn connect_proxy(port: u16) -> (SocketAddr, JoinHandle<()>) {
         }
     });
     (addr, handle)
+}
+
+/// Variant of [`connect_proxy`] that exposes the number of CONNECT sessions
+/// it accepted. The shared counter is incremented the moment a CONNECT line
+/// is parsed — so the caller can assert whether the proxy was contacted.
+pub async fn connect_proxy_counted(
+    port: u16,
+) -> (SocketAddr, Arc<std::sync::atomic::AtomicU32>, JoinHandle<()>) {
+    let listener = TcpListener::bind(("127.0.0.1", port)).await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let counter = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let counter_for_task = counter.clone();
+    let handle = tokio::spawn(async move {
+        loop {
+            if let Ok((client, _)) = listener.accept().await {
+                let c = counter_for_task.clone();
+                tokio::spawn(async move {
+                    if let Err(_e) = proxy_session_counted(client, c).await {}
+                });
+            }
+        }
+    });
+    (addr, counter, handle)
+}
+
+async fn proxy_session_counted(
+    mut client: TcpStream,
+    counter: Arc<std::sync::atomic::AtomicU32>,
+) -> io::Result<()> {
+    let mut buf = vec![0u8; 4096];
+    let mut total = 0;
+    loop {
+        if total >= buf.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "request too large",
+            ));
+        }
+        let n = client.read(&mut buf[total..]).await?;
+        if n == 0 {
+            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "eof"));
+        }
+        total += n;
+        if total >= 4 && &buf[total - 4..total] == b"\r\n\r\n" {
+            break;
+        }
+    }
+
+    let req = String::from_utf8_lossy(&buf[..total]);
+    let target = req
+        .lines()
+        .next()
+        .and_then(|l| l.strip_prefix("CONNECT "))
+        .and_then(|l| l.split_once(' '))
+        .map(|(t, _)| t)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "bad CONNECT"))?;
+
+    // Count once we've confirmed it's a real CONNECT request.
+    counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+    let (host, port_s) = target
+        .rsplit_once(':')
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "bad target"))?;
+    let port: u16 = port_s
+        .parse()
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "bad port"))?;
+
+    let origin = TcpStream::connect((host, port)).await?;
+    client
+        .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+        .await?;
+
+    let (mut cr, mut cw) = io::split(client);
+    let (mut or_, mut ow) = io::split(origin);
+    let up = async {
+        let r = io::copy(&mut cr, &mut ow).await;
+        let _ = ow.shutdown().await;
+        r
+    };
+    let down = async {
+        let r = io::copy(&mut or_, &mut cw).await;
+        let _ = cw.shutdown().await;
+        r
+    };
+    let _ = tokio::join!(up, down);
+    Ok(())
 }
 
 async fn proxy_session(mut client: TcpStream) -> io::Result<()> {

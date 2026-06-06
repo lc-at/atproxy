@@ -25,6 +25,10 @@ fn test_cli_help() {
     assert!(stdout.contains("--port"));
     assert!(stdout.contains("--ipv6"));
     assert!(stdout.contains("--verbose"));
+    assert!(
+        stdout.contains("--exclude"),
+        "help should document --exclude, got: {stdout}"
+    );
 }
 
 #[test]
@@ -403,6 +407,300 @@ root_test!(test_root_sigterm_graceful_shutdown, {
 
     assert_eq!(uid_rules_count(UID_TEST), 0, "rules removed after SIGTERM");
 
+    echo_h.abort();
+    proxy_h.abort();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+});
+
+// ---------- --exclude feature ----------
+
+/// Bad `--exclude` values should fail the binary before any iptables work.
+#[test]
+fn test_cli_exclude_invalid_ip() {
+    let output = Command::new(bin())
+        .args([
+            "--exclude",
+            "not-an-ip",
+            &UID_TEST.to_string(),
+            &format!("127.0.0.1:{PROXY_PORT}"),
+        ])
+        .output()
+        .unwrap();
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert!(
+        combined.contains("invalid") && combined.contains("--exclude"),
+        "should reject bad exclude value, output: {combined}"
+    );
+    assert!(!output.status.success(), "should exit non-zero");
+}
+
+#[test]
+fn test_cli_exclude_invalid_cidr() {
+    let output = Command::new(bin())
+        .args([
+            "--exclude",
+            "10.0.0.0/40",
+            &UID_TEST.to_string(),
+            &format!("127.0.0.1:{PROXY_PORT}"),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        !output.status.success(),
+        "CIDR /40 should be rejected, got status {:?}",
+        output.status.code()
+    );
+}
+
+#[test]
+fn test_cli_exclude_comma_separated() {
+    // Comma-separated list should be parsed (the binary will fail later at the
+    // root check, but the exclude parsing itself must succeed).
+    let output = Command::new(bin())
+        .args([
+            "--exclude",
+            "1.1.1.1,2.2.2.2,10.0.0.0/8",
+            &UID_TEST.to_string(),
+            &format!("127.0.0.1:{PROXY_PORT}"),
+        ])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    // We expect to fail at the root check, NOT at the exclude parse step.
+    assert!(
+        !stderr.contains("invalid") || !stderr.contains("--exclude"),
+        "comma-separated list should parse cleanly, stderr: {stderr}"
+    );
+}
+
+#[test]
+fn test_cli_exclude_repeated_flag() {
+    // `--exclude` may be specified multiple times; values accumulate.
+    let output = Command::new(bin())
+        .args([
+            "--exclude",
+            "1.1.1.1",
+            "--exclude",
+            "10.0.0.0/8",
+            &UID_TEST.to_string(),
+            &format!("127.0.0.1:{PROXY_PORT}"),
+        ])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("invalid") || !stderr.contains("--exclude"),
+        "repeated --exclude should parse cleanly, stderr: {stderr}"
+    );
+}
+
+// ---------- IPv6 proxy parsing ----------
+
+/// A bracketed IPv6 proxy should be accepted up to the root check (which is
+/// the same point at which the IPv4 test below fails). This exercises the
+/// bracket-stripping logic in main.rs.
+#[test]
+fn test_cli_proxy_bracketed_ipv6_accepted_until_root() {
+    let output = Command::new(bin())
+        .args([
+            &UID_TEST.to_string(),
+            &format!("[::1]:{PROXY_PORT}"),
+        ])
+        .output()
+        .unwrap();
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    // Should NOT reject on proxy parsing — only fail at the root check.
+    assert!(
+        !combined.contains("proxy must be an IPv4 or IPv6 literal"),
+        "bracketed IPv6 proxy should parse, output: {combined}"
+    );
+    assert!(
+        combined.contains("root required"),
+        "should reach root check and fail there, output: {combined}"
+    );
+}
+
+/// A bare hostname should be rejected with a clear error before any iptables
+/// work happens. Regression: ensures DNS resolution stays disabled.
+#[test]
+fn test_cli_proxy_hostname_rejected() {
+    let output = Command::new(bin())
+        .args([
+            &UID_TEST.to_string(),
+            "proxy.example.com:8080",
+        ])
+        .output()
+        .unwrap();
+    // tracing_subscriber writes to stdout by default.
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert!(
+        combined.contains("literal") || combined.contains("hostname"),
+        "hostname should be rejected with a clear error, output: {combined}"
+    );
+    assert!(!output.status.success());
+}
+
+/// An IPv4 proxy without brackets should still parse (sanity check that
+/// the new bracket-stripping logic didn't break the v4 path).
+#[test]
+fn test_cli_proxy_plain_ipv4_accepted_until_root() {
+    let output = Command::new(bin())
+        .args([
+            &UID_TEST.to_string(),
+            &format!("127.0.0.1:{PROXY_PORT}"),
+        ])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("literal"),
+        "plain IPv4 proxy should parse, stderr: {stderr}"
+    );
+}
+
+/// IPv6 entries in --exclude should be accepted at parse time.
+#[test]
+fn test_cli_exclude_ipv6_accepted() {
+    let output = Command::new(bin())
+        .args([
+            "--exclude",
+            "::1",
+            "--exclude",
+            "2001:db8::/32",
+            &UID_TEST.to_string(),
+            &format!("127.0.0.1:{PROXY_PORT}"),
+        ])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("invalid") || !stderr.contains("--exclude"),
+        "IPv6 --exclude entries should parse cleanly, stderr: {stderr}"
+    );
+}
+
+/// Mixed IPv4 + IPv6 in a single comma-separated --exclude value.
+#[test]
+fn test_cli_exclude_mixed_family_comma() {
+    let output = Command::new(bin())
+        .args([
+            "--exclude",
+            "10.0.0.0/8,::1,2001:db8::/32",
+            &UID_TEST.to_string(),
+            &format!("127.0.0.1:{PROXY_PORT}"),
+        ])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("invalid") || !stderr.contains("--exclude"),
+        "mixed-family comma-separated --exclude should parse cleanly, stderr: {stderr}"
+    );
+}
+
+// E2E: a redirected connection to an excluded IP bypasses the upstream proxy
+// and is relayed directly to the destination. The CONNECT proxy counter must
+// stay at 0; the data must round-trip through the direct echo server.
+root_test!(test_root_exclude_bypasses_proxy, {
+    add_dummy_ip("10.0.0.2");
+
+    // Echo server bound to 0.0.0.0 so it accepts connections arriving via
+    // the dummy IP on lo.
+    let (_, echo_h) = echo_server_any(29998).await;
+    let (_, proxy_count, proxy_h) = connect_proxy_counted(PROXY_PORT).await;
+
+    let _ap = Proc::spawn(
+        &bin(),
+        &[
+            &UID_TEST.to_string(),
+            &format!("127.0.0.1:{PROXY_PORT}"),
+            "-p",
+            &TPROXY_PORT.to_string(),
+            "--exclude",
+            "10.0.0.2",
+        ],
+    );
+    assert!(wait_for_port(TPROXY_PORT).await, "atproxy did not start");
+
+    // Connection to the excluded IP should succeed (direct passthrough).
+    let result = String::from_utf8_lossy(
+        &run_as_uid(UID_TEST, "echo EXCL_DIRECT | nc -w3 10.0.0.2 29998").stdout,
+    )
+    .into_owned();
+    assert!(
+        result.contains("EXCL_DIRECT"),
+        "excluded path should round-trip via direct relay, got: {result:?}"
+    );
+
+    // Allow any pending I/O to settle before reading the counter.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let count = proxy_count.load(std::sync::atomic::Ordering::Relaxed);
+    assert_eq!(
+        count, 0,
+        "proxy should NOT have been contacted for excluded IP, but counter={count}"
+    );
+
+    drop(_ap);
+    remove_dummy_ip("10.0.0.2");
+    echo_h.abort();
+    proxy_h.abort();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+});
+
+// E2E: a redirected connection to a non-excluded IP must still go through the
+// upstream proxy. Sanity check that the exclude feature doesn't break the
+// default path. Also exercises CIDR matching: `--exclude 10.0.0.0/30` covers
+// 10.0.0.0–10.0.0.3, so 10.0.0.5 must NOT be excluded.
+root_test!(test_root_exclude_does_not_break_proxy_path, {
+    add_dummy_ip("10.0.0.5");
+
+    let (_, echo_h) = echo_server_any(29997).await;
+    let (_, proxy_count, proxy_h) = connect_proxy_counted(PROXY_PORT).await;
+
+    let _ap = Proc::spawn(
+        &bin(),
+        &[
+            &UID_TEST.to_string(),
+            &format!("127.0.0.1:{PROXY_PORT}"),
+            "-p",
+            &TPROXY_PORT.to_string(),
+            "--exclude",
+            "10.0.0.0/30", // 10.0.0.0–10.0.0.3
+        ],
+    );
+    assert!(wait_for_port(TPROXY_PORT).await);
+
+    // 10.0.0.5 is outside the excluded CIDR → must go through the proxy.
+    let result = String::from_utf8_lossy(
+        &run_as_uid(UID_TEST, "echo VIA_PROXY | nc -w3 10.0.0.5 29997").stdout,
+    )
+    .into_owned();
+    assert!(
+        result.contains("VIA_PROXY"),
+        "non-excluded path should round-trip via proxy, got: {result:?}"
+    );
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let count = proxy_count.load(std::sync::atomic::Ordering::Relaxed);
+    assert_eq!(
+        count, 1,
+        "proxy should have been contacted exactly once, got {count}"
+    );
+
+    drop(_ap);
+    remove_dummy_ip("10.0.0.5");
     echo_h.abort();
     proxy_h.abort();
     tokio::time::sleep(Duration::from_millis(200)).await;

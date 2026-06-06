@@ -13,7 +13,13 @@ pub struct Cli {
     #[arg(value_name = "TARGET")]
     pub target: Option<String>,
 
-    /// Upstream HTTP proxy address (host:port).
+    /// Upstream HTTP proxy address (IP:port).
+    ///
+    /// Accepts both IPv4 (`1.2.3.4:8080`) and IPv6 (`[::1]:8080`) literals.
+    /// DNS hostnames are not resolved — on Android the system resolver is
+    /// unreliable under musl, so atproxy requires the IP explicitly. If your
+    /// proxy only has a hostname, add an entry to `/etc/hosts` on the device
+    /// first.
     #[arg(value_name = "PROXY")]
     pub proxy: Option<String>,
 
@@ -32,4 +38,13 @@ pub struct Cli {
     /// Remove stale iptables rules for resolved UIDs and exit.
     #[arg(long)]
     pub clean: bool,
+
+    /// Destination IPv4 addresses or CIDR ranges to exclude from the upstream
+    /// proxy. Connections whose `SO_ORIGINAL_DST` matches an entry bypass the
+    /// proxy and are relayed directly to the destination.
+    ///
+    /// May be specified multiple times and/or as a comma-separated list.
+    /// Examples: `--exclude 10.0.0.0/8`, `--exclude 1.1.1.1,8.8.8.8`.
+    #[arg(long, value_name = "IP[/MASK]", value_delimiter = ',')]
+    pub exclude: Vec<String>,
 }
